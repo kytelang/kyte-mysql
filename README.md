@@ -10,7 +10,7 @@ kyte get https://github.com/kytelang/kyte-mysql
 import mysql;
 ```
 
-## Structure (SOLID)
+## Design
 
 Split by responsibility; consumers only touch the driver interface (`MyDriver` / `MyConnection`).
 
