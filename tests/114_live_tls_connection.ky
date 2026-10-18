@@ -1,0 +1,67 @@
+// Live MySQL integration gate. Drives connect-over-TLS -> SELECT -> close MANY times ON A REACTOR
+// (real async socket I/O needs one; a bare @test has no reactor to resume the awaits). Run under
+// KYTE_ASAN=1 KYTE_ARC_AUDIT=1 to prove there is no double-free / use-after-free and no per-connection
+// leak on the shared TLS client path.
+//
+// Gated on KYTE_MYSQL_URL so `kyte test` without a server is a no-op (CI stays green). The database in
+// the URL must EXIST (the server validates it during the handshake and returns an ERR otherwise). To run
+// live against a stock server, point it at the always-present `mysql` schema:
+//   KYTE_MYSQL_URL='mysql://root@127.0.0.1:3306/mysql?sslmode=skip-verify' \
+//     KYTE_ASAN=1 KYTE_ARC_AUDIT=1 kyte test
+
+import assert;
+import list;
+import string;
+import bytes;
+import env;
+import net.poller;
+import db;
+import mysql;
+
+fn cell(c: long): int { return bytes.read_i32(c, 0) as int; }
+
+async fn dbLoop(url: string, iters: int, done: long, okc: long): void {
+    let drv = mysql.MyDriver();
+    let ok = 0;
+    let i = 0;
+    while (i < iters) {
+        let conn = await drv.connect(url);
+        let rs = await conn.query("SELECT 1", List<DbValue>());
+        if (rs.rowCount() == 1) { ok = ok + 1; }
+        conn.close();               // a double-free would fire here under ASAN
+        i = i + 1;
+    }
+    bytes.write_i32(okc, 0, ok);
+    bytes.write_i32(done, 0, 1);
+}
+
+@test
+fn live_tls_connect_query_close_loop(): void {
+    let url = env.get("KYTE_MYSQL_URL");
+    if (string.eql(url, "")) { return; }   // no live server configured -> skip
+
+    let iters = 25;
+    let r = poller.Reactor(64, 8192, 32);
+    poller.setCurrent(r.kq);
+    let done = bytes.alloc(4); bytes.write_i32(done, 0, 0);
+    let okc = bytes.alloc(4); bytes.write_i32(okc, 0, 0);
+
+    coroStart(dbLoop(url, iters, done, okc));
+
+    let guard = 0;
+    while (cell(done) == 0 && guard < 40000) {
+        let nev = r.pollComplete(500);
+        poller.batchBegin();
+        let i = 0;
+        while (i < nev) { kyte_reactor_resume(r.completedToken(i)); i = i + 1; }
+        guard = guard + 1;
+    }
+
+    assert.equalInt(cell(done), 1);      // the loop finished (did not hang)
+    assert.equalInt(cell(okc), iters);   // every connect+query round-trip succeeded
+
+    poller.setCurrent(0);
+    bytes.free(done);
+    bytes.free(okc);
+    r.destroy();
+}

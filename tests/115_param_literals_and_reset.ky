@@ -1,0 +1,80 @@
+// Offline gates for two driver fixes:
+//
+//   1. convertDollarParams is literal- and comment-aware: a `$N` inside a single- or double-quoted
+//      string literal, a backtick identifier, or a comment is copied through untouched and does NOT
+//      consume a param slot. Previously `'cost is $5'` was corrupted into a `?` and ate a param.
+//   2. buildResetConnection emits a COM_RESET_CONNECTION (0x1f) frame - the pool reset hook that clears
+//      session/transaction state server-side on release.
+import assert;
+import string;
+import list;
+import db;
+import codec;
+import mysql;
+
+@test
+fn test_param_outside_literals_unchanged(): void {
+    // Baseline: outside any literal, $N still rewrites to ? and reorders params by appearance.
+    let p = List<DbValue>();
+    p.push(db.dbInt(10));   // $1
+    p.push(db.dbInt(20));   // $2
+    let cq = mysql.convertDollarParams("SELECT * FROM t WHERE a = $2 AND b = $1", p);
+    assert.equalStr(cq.sql, "SELECT * FROM t WHERE a = ? AND b = ?");
+    assert.equalInt(cq.params.size(), 2);
+    assert.equalInt((cq.params.get(0) ?? db.dbNull()).asInt(), 20);   // $2 first
+    assert.equalInt((cq.params.get(1) ?? db.dbNull()).asInt(), 10);   // $1 second
+}
+
+@test
+fn test_dollar_in_single_quoted_literal_left_untouched(): void {
+    // `$5` inside a single-quoted literal must survive verbatim and NOT consume a param slot.
+    let p = List<DbValue>();
+    p.push(db.dbInt(7));   // the only real placeholder, $1
+    let cq = mysql.convertDollarParams("INSERT INTO t(note, id) VALUES ('cost is $5', $1)", p);
+    assert.equalStr(cq.sql, "INSERT INTO t(note, id) VALUES ('cost is $5', ?)");
+    assert.equalInt(cq.params.size(), 1);
+    assert.equalInt((cq.params.get(0) ?? db.dbNull()).asInt(), 7);
+}
+
+@test
+fn test_dollar_in_double_quoted_and_backtick_left_untouched(): void {
+    let p = List<DbValue>();
+    p.push(db.dbInt(1));
+    // Double-quoted literal and backtick identifier both protect their `$N`.
+    let cq = mysql.convertDollarParams("SELECT \"a $2 b\", `c $3 d` FROM t WHERE x = $1", p);
+    assert.equalStr(cq.sql, "SELECT \"a $2 b\", `c $3 d` FROM t WHERE x = ?");
+    assert.equalInt(cq.params.size(), 1);
+}
+
+@test
+fn test_doubled_quote_escape_in_literal(): void {
+    // A doubled quote inside a literal is an escaped quote, not the literal's end; the `$9` after it is
+    // still inside the string and must be left alone.
+    let p = List<DbValue>();
+    p.push(db.dbInt(4));
+    let cq = mysql.convertDollarParams("SELECT 'it''s $9 here' , $1", p);
+    assert.equalStr(cq.sql, "SELECT 'it''s $9 here' , ?");
+    assert.equalInt(cq.params.size(), 1);
+}
+
+@test
+fn test_dollar_in_comments_left_untouched(): void {
+    // `$N` inside a `-- ` line comment and a `/* ... */` block comment is not rewritten.
+    let p = List<DbValue>();
+    p.push(db.dbInt(2));
+    let cq = mysql.convertDollarParams("SELECT $1 /* keep $7 */ , 1 -- trailing $8\n", p);
+    assert.equalStr(cq.sql, "SELECT ? /* keep $7 */ , 1 -- trailing $8\n");
+    assert.equalInt(cq.params.size(), 1);
+}
+
+@test
+fn test_reset_connection_frame(): void {
+    // COM_RESET_CONNECTION: [u24 len = 1][seq 0][0x1f]. Payload is the single command byte 0x1f (31).
+    let f = codec.buildResetConnection();
+    assert.equalInt(f.length, 5);   // 3 (len) + 1 (seq) + 1 (cmd)
+    assert.equalInt(f[0], 1);       // payload length low byte
+    assert.equalInt(f[1], 0);
+    assert.equalInt(f[2], 0);
+    assert.equalInt(f[3], 0);       // sequence id 0
+    assert.equalInt(f[4], 31);      // 0x1f COM_RESET_CONNECTION
+}

@@ -1,0 +1,75 @@
+// auth - the MySQL authentication scrambles + client capability flags (SRP: auth only).
+// MySQL auth-response scrambles, in pure Kyte over the crypto/hash primitives (no runtime shim).
+// These are protocol-specific obfuscations (NOT general cryptography):
+//
+//   native: SHA1(pw) XOR SHA1(salt ++ SHA1(SHA1(pw)))          (20 raw bytes)
+//   sha2:   SHA256(pw) XOR SHA256(SHA256(SHA256(pw)) ++ salt)  (32 raw bytes)
+//
+// `salt` is the server's scramble; the result is binary (may contain NULs).
+// Public so the driver's codec gate can golden-verify them; not general crypto. The driver interface
+// (mysql.ky) decides WHICH scramble to send for the server's chosen auth plugin; codec
+// uses clientCapabilities to build the HandshakeResponse.
+import crypto.hash.sha;
+import crypto.rsa;
+import bytes;
+import string;
+
+fn catBytes(a: string, b: string): string {
+    let out = bytes.alloc(a.length + b.length);
+    let i = 0;
+    while (i < a.length) { bytes.write_byte(out, i, bytes.read_byte(a as ptr, i)); i = i + 1; }
+    let j = 0;
+    while (j < b.length) { bytes.write_byte(out, a.length + j, bytes.read_byte(b as ptr, j)); j = j + 1; }
+    return out as string;
+}
+
+pub fn mysqlNativeScramble(password: string, salt: string): string {
+    let stage1 = sha.sha1Raw(password);                 // SHA1(pw)
+    let stage2 = sha.sha1Raw(stage1);                   // SHA1(SHA1(pw))
+    let seed = sha.sha1Raw(catBytes(salt, stage2));     // SHA1(salt ++ stage2)
+    let out = bytes.alloc(20);
+    let i = 0;
+    while (i < 20) { bytes.write_byte(out, i, bytes.read_byte(stage1 as ptr, i) ^ bytes.read_byte(seed as ptr, i)); i = i + 1; }
+    return out as string;
+}
+
+pub fn mysqlSha2Scramble(password: string, salt: string): string {
+    let stage1 = sha.sha256Raw(password);               // SHA256(pw)
+    let stage2 = sha.sha256Raw(stage1);                 // SHA256(SHA256(pw))
+    let seed = sha.sha256Raw(catBytes(stage2, salt));   // SHA256(stage2 ++ salt)
+    let out = bytes.alloc(32);
+    let i = 0;
+    while (i < 32) { bytes.write_byte(out, i, bytes.read_byte(stage1 as ptr, i) ^ bytes.read_byte(seed as ptr, i)); i = i + 1; }
+    return out as string;
+}
+
+// T14 Feature 2: caching_sha2_password fast-auth scramble, exposed under its protocol name.
+//   token = SHA256(pw) XOR SHA256( SHA256(SHA256(pw)) ++ nonce )   (32 raw bytes)
+// This is exactly `mysqlSha2Scramble` (the wire driver's spelling); it is provided as a pure,
+// golden/round-trip-testable entry point. sha256_password uses the same fast-auth scramble.
+pub fn cachingSha2Scramble(password: string, nonce: string): string {
+    return mysqlSha2Scramble(password, nonce);
+}
+
+// D6: caching_sha2_password FULL auth (uncached password over a plaintext channel). The client
+// obfuscates the password by XOR-ing (password + a trailing NUL) with the 20-byte server nonce
+// cyclically, then RSA-OAEP-encrypts that under the server's RSA public key (PEM). Returns the
+// ciphertext (RSA-modulus-sized raw bytes).
+pub fn rsaEncryptPassword(password: string, salt: string, pem: string): string {
+    let n = password.length + 1;              // include the trailing NUL byte
+    let buf = bytes.alloc(n);
+    let i = 0;
+    while (i < n) {
+        let pc = if (i < password.length) bytes.read_byte(password, i) else 0;
+        let sc = bytes.read_byte(salt, i % salt.length);
+        bytes.write_byte(buf, i, pc ^ sc);
+        i = i + 1;
+    }
+    let xored = buf as string;                 // length-n Kyte string (may contain NULs)
+    return rsa.oaepEncryptSha1(pem, xored, n);
+}
+
+// --- Capability flags (client) ------------------------------------------------
+// LONG_PASSWORD(1) | CONNECT_WITH_DB(8) | PROTOCOL_41(0x200) | TRANSACTIONS(0x2000)
+// | SECURE_CONNECTION(0x8000) | PLUGIN_AUTH(0x80000)
+pub fn clientCapabilities(): int { return 1 + 8 + 512 + 8192 + 32768 + 524288; }

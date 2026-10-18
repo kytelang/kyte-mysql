@@ -1,0 +1,158 @@
+// proto - the async transport framing (SRP: read/write whole MySQL packets off a live
+// stream). Buffered reader over an AsyncIO; the socket I/O is non-blocking - `fill` awaits
+// `io.recvInto`, which PARKS the coroutine (asio arecv) instead of blocking the scheduler
+// thread. `io` is an AsyncStream; a TLS variant (TlsStream) drops in unchanged via the shared
+// recvInto shape. Knows the packet framing ([u24 len LE][seq][payload] + >=16MB continuation)
+// only - payload MEANING lives in codec.
+import net.aio;
+import bytes;
+import codec;
+
+// --- Buffered packet reader over a live TCP stream ----------------------------
+pub struct MyReader {
+    pub io: aio.AsyncIO,   // A1 async-first: fill awaits io.recvInto (parks, no thread held)
+    pub buf: ptr,
+    pub cap: int,
+    pub len: int,
+    pub pos: int,
+    init(io: aio.AsyncIO) {
+        self.io = io;
+        self.cap = 65536;
+        self.buf = bytes.alloc(65536);
+        self.len = 0;
+        self.pos = 0;
+    }
+
+    // `buf` is a raw `ptr`, not an ARC-managed field, so ARC won't free it - the
+    // destructor must (else the 64KB read buffer leaks per connection). Mirrors
+    // BtReader.delete.
+    fn delete(self: MyReader): void {
+        if (self.buf != 0) {
+            bytes.free(self.buf);
+            self.buf = 0;
+        }
+    }
+}
+async fn fill(r: MyReader): bool {
+    if (r.pos > 0) {
+        let i = 0;
+        while (r.pos + i < r.len) {
+            bytes.write_byte(r.buf, i, bytes.read_byte(r.buf, r.pos + i));
+            i = i + 1;
+        }
+        r.len = r.len - r.pos;
+        r.pos = 0;
+    }
+    let space = r.cap - r.len;
+    let n = await r.io.recvInto((r.buf as long) + (r.len as long), space);   // parks the coroutine
+    if (n <= 0) { return false; }
+    r.len = r.len + n;
+    return true;
+}
+// Grow the reader ring to hold at least `k` bytes resident, preserving the live [pos,len) window.
+// Without this a single value/packet larger than the initial 64 KB ring could never be read (fill's
+// `space` would be 0 and recvInto(_, 0) returns 0 -> need fails). MySQL packet bodies cap at 16 MB.
+fn growBuf(r: MyReader, k: int): void {
+    let newcap = r.cap;
+    while (newcap < k) { newcap = newcap * 2; }
+    let nb = bytes.alloc(newcap);
+    let live = r.len - r.pos;
+    let i = 0;
+    while (i < live) { bytes.write_byte(nb, i, bytes.read_byte(r.buf, r.pos + i)); i = i + 1; }
+    bytes.free(r.buf);
+    r.buf = nb;
+    r.cap = newcap;
+    r.len = live;
+    r.pos = 0;
+}
+async fn need(r: MyReader, k: int): bool {
+    if (k > r.cap) { growBuf(r, k); }
+    while (r.len - r.pos < k) { if (!(await fill(r))) { return false; } }
+    return true;
+}
+fn rbyte(r: MyReader): int { let b = bytes.read_byte(r.buf, r.pos); r.pos = r.pos + 1; return b; }
+
+// A whole MySQL packet payload (header stripped). Returns "" with ok=false at EOF.
+pub struct Packet {
+    pub payload: string,
+    pub ok: bool,
+    pub seq: int,
+    init(payload: string, ok: bool) { self.payload = payload; self.ok = ok; self.seq = 0; }
+}
+pub async fn readPacket(r: MyReader): Packet {
+    if (!(await need(r, 4))) { return Packet("", false); }
+    let a = rbyte(r); let b = rbyte(r); let c = rbyte(r);
+    let plen = a + b * 256 + c * 65536;
+    let seq = rbyte(r);
+    if (plen > 0) { if (!(await need(r, plen))) { return Packet("", false); } }
+    let out = bytes.alloc(plen);
+    let i = 0;
+    while (i < plen) { bytes.write_byte(out, i, bytes.read_byte(r.buf, r.pos + i)); i = i + 1; }
+    r.pos = r.pos + plen;
+    // Bind the `as string` cast to a local so it's registered as an owned temporary -
+    // an inline `out as string` as a constructor arg is NOT tracked as owned, so the
+    // packet payload leaked (same ARC-edge as the BtReader fix).
+    let payload = out as string;
+    // T14 Feature 1: multi-packet reassembly. plen == 0xFFFFFF marks a continuation: the logical
+    // payload continues in the following packets until one with len < 0xFFFFFF ends the run (which may
+    // be a 0-length terminator). Concatenate every continuation body so ALL callers (query/exec/
+    // handshake) transparently receive the full logical payload. This mirrors the pure
+    // `reassemblePayload` join rule (which the offline gate verifies). NOTE: a single logical chunk is
+    // still bounded by the 64KB reader ring (a pre-existing limit, orthogonal to this feature).
+    while (plen == codec.MYSQL_MAX_PACKET) {
+        if (!(await need(r, 4))) { return Packet("", false); }
+        let a2 = rbyte(r); let b2 = rbyte(r); let c2 = rbyte(r);
+        plen = a2 + b2 * 256 + c2 * 65536;
+        seq = rbyte(r);
+        if (plen > 0) { if (!(await need(r, plen))) { return Packet("", false); } }
+        let cont = bytes.alloc(plen);
+        let j = 0;
+        while (j < plen) { bytes.write_byte(cont, j, bytes.read_byte(r.buf, r.pos + j)); j = j + 1; }
+        r.pos = r.pos + plen;
+        let contStr = cont as string;
+        payload = payload + contStr;
+    }
+    let pk = Packet(payload, true);
+    pk.seq = seq;
+    return pk;
+}
+
+// SYNC packet framing (parity with the Postgres driver's tryFrame). A whole result set is a run of small
+// packets already sitting in the reader ring; parsing each with an `await readPacket` costs one coroutine
+// suspension PER ROW (200 for a 200-row result). tryPacket parses the next packet WITHOUT awaiting when it
+// is fully buffered, so a whole result decodes with ~one `await fillReader` per socket fill (~4 total),
+// killing the per-row coroutine-frame churn. Status: 0 = a packet body is buffered at [off, off+len) in
+// r.buf (cursor advanced past it); -2 = not enough bytes yet (cursor untouched, caller fills + retries);
+// -3 = a >=16MB continuation packet (rare, big BLOB) -> caller falls back to async readPacket to reassemble.
+pub struct MyPkt {
+    pub status: int,
+    pub off: int,
+    pub len: int,
+    init(status: int, off: int, len: int) { self.status = status; self.off = off; self.len = len; }
+}
+pub fn tryPacket(r: MyReader): MyPkt {
+    if (r.len - r.pos < 4) { return MyPkt(-2, 0, 0); }        // header not buffered
+    let savedPos = r.pos;
+    let a = rbyte(r); let b = rbyte(r); let cc = rbyte(r);
+    let plen = a + b * 256 + cc * 65536;
+    let seq = rbyte(r);                                       // consume the sequence byte
+    if (seq < 0) { return MyPkt(-1, 0, 0); }                  // (keeps `seq` live; unreachable guard)
+    if (plen == codec.MYSQL_MAX_PACKET) { r.pos = savedPos; return MyPkt(-3, 0, 0); }  // multi-packet -> async
+    if (r.len - r.pos < plen) { r.pos = savedPos; return MyPkt(-2, 0, 0); }            // body not buffered yet
+    let off = r.pos;
+    r.pos = r.pos + plen;
+    return MyPkt(0, off, plen);
+}
+// Materialise a buffered packet body (from tryPacket's off/len view) into an owned string via a single
+// memcpy -- the same one copy readPacket did, but with no await and no per-packet multi-packet checks.
+pub fn pktStr(r: MyReader, off: int, len: int): string {
+    let out = bytes.alloc(len);
+    bytes.copy(out as long, (r.buf as long) + (off as long), len);
+    return out as string;
+}
+// Async fill exposed to the sync-framing row loop (fill is module-private otherwise).
+pub async fn fillReader(r: MyReader): bool { return await fill(r); }
+
+pub async fn sendPacket(io: aio.AsyncIO, frame: string): int {
+    return await io.sendStr(frame);
+}

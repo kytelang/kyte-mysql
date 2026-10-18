@@ -1,0 +1,127 @@
+// typemap - type mapping between MySQL's wire types and the `db` interface
+// (SRP: types & values only). Three jobs:
+//   - MySQL column type code -> DbType   (typeToDbType)
+//   - wire text -> typed DbValue          (decodeCell)
+//   - DbValue -> SQL / bind text          (valueToSql/valueToBindText + escaping, substituteParams)
+// Pure over strings + the db value model; no socket, no framing. The binary-protocol value
+// decoders (which need a byte cursor) live in codec, alongside the wire framing they belong to.
+import string;
+import list;
+import db;
+
+// --- MySQL column type codes -> db interface DbType -------------------------------
+pub fn typeToDbType(t: int): DbType {
+    if (t == 1) { return DbType.Int4; }    // TINY
+    if (t == 2) { return DbType.Int4; }    // SHORT
+    if (t == 3) { return DbType.Int4; }    // LONG
+    if (t == 9) { return DbType.Int4; }    // INT24
+    if (t == 8) { return DbType.Int8; }    // LONGLONG
+    if (t == 4) { return DbType.Float4; }  // FLOAT
+    if (t == 5) { return DbType.Float8; }  // DOUBLE
+    if (t == 0) { return DbType.Decimal; }   // DECIMAL
+    if (t == 246) { return DbType.Decimal; } // NEWDECIMAL
+    if (t == 7) { return DbType.Timestamp; }  // TIMESTAMP
+    if (t == 12) { return DbType.Timestamp; } // DATETIME
+    if (t == 10) { return DbType.Timestamp; } // DATE  (temporal, not raw Text)
+    if (t == 14) { return DbType.Timestamp; } // NEWDATE
+    if (t == 13) { return DbType.Int4; }      // YEAR  (an integer, so getInt works)
+    if (t == 16) { return DbType.Blob; }      // BIT   (raw bits - keep bytes intact)
+    if (t == 255) { return DbType.Blob; }     // GEOMETRY (WKB - binary)
+    if (t == 252) { return DbType.Blob; }  // BLOB
+    // TIME(11) stays Text ("HH:MM:SS"); JSON(245)/ENUM(247)/SET(248)/VARCHAR/VAR_STRING(253)/
+    // STRING(254) are genuinely textual -> Text.
+    return DbType.Text;
+}
+
+// --- wire text -> typed DbValue -----------------------------------------------
+pub fn decodeCell(t: DbType, raw: string, isNull: bool): DbValue {
+    if (isNull) { return db.dbNull(); }
+    if (t == DbType.Bool) {
+        return db.dbBool(string.eql(raw, "1") || string.eql(raw, "t") || string.eql(raw, "true"));
+    }
+    if (t == DbType.Int4 || t == DbType.Uint4) { return db.dbInt(string.parseI64(raw)); }
+    if (t == DbType.Int8 || t == DbType.Uint8) { return db.dbLong(string.parseI64(raw)); }
+    // Temporal (text protocol) arrives as "YYYY-MM-DD HH:MM:SS"; keep it verbatim. The old code grouped
+    // it with Int8 and ran parseI64, which returned just the leading year -> garbage.
+    if (t == DbType.Timestamp) { return db.dbTimestamp(raw); }
+    if (t == DbType.Float4 || t == DbType.Float8) { return db.dbDouble(string.parseFloat(raw)); }
+    if (t == DbType.Decimal) { return DbValue(DbType.Decimal, 0, 0.0, decimal.fromString(raw), raw); } // S4: exact .dec
+    return db.dbText(raw);
+}
+
+// --- DbValue -> bind TEXT format ----------------------------------------------
+// A bound parameter's value as TEXT (the driver sends every param as MYSQL_TYPE_VAR_STRING and
+// lets the server coerce to the column type - the binary analogue of PG's text-format Bind).
+pub fn valueToBindText(v: DbValue): string {
+    if (v.kind == DbType.Bool) { if (v.asBool()) { return "1"; } return "0"; }
+    if (v.kind == DbType.Text || v.kind == DbType.Blob) { return v.asText(); }
+    if (v.kind == DbType.Decimal) { return v.asText(); }
+    // Timestamp/Uuid/Json/Array carry their canonical text in `s`; without this they
+    // fell through to asLong() and bound as "0" (silent data loss on every
+    // datetime/uuid/json/array param). MSSQL already handles this; mirror it here.
+    if (v.kind == DbType.Timestamp || v.kind == DbType.Uuid || v.kind == DbType.Json || v.kind == DbType.Array) { return v.asText(); }
+    if (v.kind == DbType.Float4 || v.kind == DbType.Float8) { let d = v.asDouble(); return `${d}`; }
+    let iv = v.asLong();
+    return `${iv}`;
+}
+
+// --- DbValue -> inline SQL literal (client-side $N substitution) --------------
+fn escapeText(s: string): string {
+    let out = "'";
+    let i = 0;
+    let n = s.length;
+    while (i < n) {
+        let ch = s[i];
+        if (ch == 39) { out = out + "''"; }        // ' -> ''
+        else if (ch == 92) { out = out + "\\\\"; } // \ -> \\  (MySQL backslash escaping)
+        else { out = out + string.slice(s, i, i + 1); }
+        i = i + 1;
+    }
+    return out + "'";
+}
+// MySQL binary literal x'HEX' -- binary-safe (NUL/quotes), unlike text-escaping raw bytes.
+fn mysqlBlobLiteral(s: string): string {
+    let out = "x'";
+    let i = 0;
+    while (i < s.length) {
+        let b = s[i];
+        out = out + myHexDigit((b / 16) & 15) + myHexDigit(b & 15);
+        i = i + 1;
+    }
+    return out + "'";
+}
+fn myHexDigit(v: int): string {
+    if (v < 10) { return string.slice("0123456789", v, v + 1); }
+    return string.slice("abcdef", v - 10, v - 10 + 1);
+}
+fn valueToSql(v: DbValue): string {
+    if (v.isNull()) { return "NULL"; }
+    if (v.kind == DbType.Bool) { if (v.asBool()) { return "1"; } return "0"; }
+    if (v.kind == DbType.Blob) { return mysqlBlobLiteral(v.asText()); }
+    if (v.kind == DbType.Text) { return escapeText(v.asText()); }
+    if (v.kind == DbType.Decimal) { return v.asText(); }
+    if (v.kind == DbType.Float4 || v.kind == DbType.Float8) { let d = v.asDouble(); return `${d}`; }
+    let iv = v.asLong();
+    return `${iv}`;
+}
+
+pub fn substituteParams(sql: string, params: List<DbValue>): string {
+    let out = "";
+    let i = 0;
+    let n = sql.length;
+    while (i < n) {
+        // '$' + one or more digits -> parameter N (1-based). Multi-digit required for >9-column ORM inserts.
+        if (sql[i] == 36 && i + 1 < n && sql[i + 1] >= 48 && sql[i + 1] <= 57) {
+            let j = i + 1;
+            let num = 0;
+            while (j < n && sql[j] >= 48 && sql[j] <= 57) { num = num * 10 + (sql[j] - 48); j = j + 1; }
+            let p = params.get(num - 1) ?? db.dbNull();
+            out = out + valueToSql(p);
+            i = j;
+        } else {
+            out = out + string.slice(sql, i, i + 1);
+            i = i + 1;
+        }
+    }
+    return out;
+}

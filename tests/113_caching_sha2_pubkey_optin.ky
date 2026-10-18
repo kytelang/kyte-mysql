@@ -1,0 +1,33 @@
+// caching_sha2_password full-auth safety: the driver must NOT retrieve the server's RSA public key and
+// send the password under it over a PLAINTEXT connection unless the caller explicitly opts in with
+// allowPublicKeyRetrieval=true (an unauthenticated key lets a MITM decrypt the password). This gate locks
+// the opt-in parsing (the refusal itself lives in the async full-auth path, guarded by this flag + the TLS
+// `secure` flag). Also imports the driver so the guarded code compiles.
+import assert;
+import string;
+import connection;
+import mysql;
+
+@test
+fn public_key_retrieval_off_by_default() {
+    let d = connection.parse("mysql://root:secret@127.0.0.1:3306/app");
+    assert.isTrue(!d.allowPublicKeyRetrieval);
+}
+
+@test
+fn public_key_retrieval_opt_in_true() {
+    let d = connection.parse("mysql://root:secret@127.0.0.1:3306/app?allowPublicKeyRetrieval=true");
+    assert.isTrue(d.allowPublicKeyRetrieval);
+}
+
+@test
+fn public_key_retrieval_opt_in_one() {
+    let d = connection.parse("mysql://root@127.0.0.1/app?sslmode=disable&allowPublicKeyRetrieval=1");
+    assert.isTrue(d.allowPublicKeyRetrieval);
+}
+
+@test
+fn driver_compiles() {
+    let drv = mysql.MyDriver();
+    assert.isTrue(true);
+}

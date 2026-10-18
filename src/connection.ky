@@ -1,0 +1,76 @@
+// connection: MySQL connection-string parsing (SRP: connection string only).
+// `mysql://user[:password]@host[:port]/database?sslmode=...&sslrootcert=...`
+// Pure string work; no I/O, no db interface. The driver interface (mysql.ky) turns a ConnectionOptions into a
+// live connection.
+import string;
+
+pub struct ConnectionOptions {
+    pub host: string,
+    pub port: int,
+    pub user: string,
+    pub password: string,
+    pub database: string,
+    pub sslmode: string,       // "disable" (default) | "skip-verify" (encrypt, no verify) | "require" | "verify-ca" | "verify-full" (all verify the CA bundle, fail closed)
+    pub sslrootcert: string,   // PEM CA bundle path (verify-full)
+    pub allowPublicKeyRetrieval: bool,   // opt-in to fetching the server RSA key for caching_sha2 full-auth over a PLAINTEXT link (default false; MITM risk -- see mysql.ky)
+    init(host: string, port: int, user: string, password: string, database: string, sslmode: string, sslrootcert: string, allowPublicKeyRetrieval: bool) {
+        self.host = host; self.port = port; self.user = user;
+        self.password = password; self.database = database;
+        self.sslmode = sslmode; self.sslrootcert = sslrootcert;
+        self.allowPublicKeyRetrieval = allowPublicKeyRetrieval;
+    }
+}
+// Pull `key=value` out of a `?a=b&c=d` connection string query string (returns `dflt` if absent).
+fn queryParam(connectionString: string, key: string, dflt: string): string {
+    let needle = key + "=";
+    let idx = string.indexOf(connectionString, needle);
+    if (idx == -1) { return dflt; }
+    let rest = string.slice(connectionString, idx + needle.length, connectionString.length);
+    let amp = string.indexOf(rest, "&");
+    if (amp == -1) { return rest; }
+    return string.slice(rest, 0, amp);
+}
+// The connect deadline in milliseconds. `?connect_timeout=<seconds>` (libpq-style), default 10 s. A
+// value <= 0 disables the deadline (wait forever). Bounds a dead/firewalled host at connect time.
+pub fn connectTimeoutMs(connectionString: string): int {
+    let secs = string.parseI64(queryParam(connectionString, "connect_timeout", "10")) as int;
+    if (secs < 0) { return 0; }
+    return secs * 1000;
+}
+pub fn parse(connectionString: string): ConnectionOptions {
+    let sslmode = queryParam(connectionString, "sslmode", "disable");
+    let sslrootcert = queryParam(connectionString, "sslrootcert", "");
+    let apkr = queryParam(connectionString, "allowPublicKeyRetrieval", "false");
+    let allowPublicKeyRetrieval = string.eql(apkr, "true") || string.eql(apkr, "1");
+
+    let s = connectionString;
+    let scheme = string.indexOf(s, "://");
+    if (scheme != -1) { s = string.slice(s, scheme + 3, s.length); }
+    let qq = string.indexOf(s, "?");
+    if (qq != -1) { s = string.slice(s, 0, qq); }
+
+    let user = "root";
+    let password = "";
+    let at = string.lastIndexOf(s, "@");
+    if (at != -1) {
+        let cred = string.slice(s, 0, at);
+        s = string.slice(s, at + 1, s.length);
+        let colon = string.indexOf(cred, ":");
+        if (colon == -1) { user = cred; }
+        else { user = string.slice(cred, 0, colon); password = string.slice(cred, colon + 1, cred.length); }
+    }
+    let database = "";
+    let slash = string.indexOf(s, "/");
+    if (slash != -1) {
+        database = string.slice(s, slash + 1, s.length);
+        s = string.slice(s, 0, slash);
+    }
+    let host = s;
+    let port = 3306;
+    let pc = string.lastIndexOf(s, ":");
+    if (pc != -1) {
+        host = string.slice(s, 0, pc);
+        port = string.parseI64(string.slice(s, pc + 1, s.length));
+    }
+    return ConnectionOptions(host, port, user, password, database, sslmode, sslrootcert, allowPublicKeyRetrieval);
+}

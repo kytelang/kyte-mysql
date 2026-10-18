@@ -1,0 +1,770 @@
+// mysql.ky - the MySQL/MariaDB driver interface: MyConnection (impl db.Connection) and
+// MyDriver (impl db.Driver). This module orchestrates the connection lifecycle + the
+// request/response loops over the MySQL client/server protocol; every other responsibility
+// lives in its own module (SOLID/SRP):
+//
+//   connection      connection-string parsing        (ConnectionOptions, parse)
+//   codec    the MySQL wire codec             (build* frames + decode* responses, MyCursor)
+//   typemap  MySQL type <-> DbType + value<->SQL/bind (typeToDbType, decodeCell, substituteParams)
+//   proto    async transport framing          (MyReader, Packet, readPacket, sendPacket)
+//   stmt     prepared-statement cache entry   (MyStmt)
+//   auth     the auth scrambles + capabilities (mysqlNativeScramble, mysqlSha2Scramble, ...)
+//
+// MyConnection/MyDriver are the only names consumers touch: `import mysql; MyDriver()`.
+//
+//   let drv = MyDriver();
+//   let conn = drv.connect("mysql://user:pass@127.0.0.1:3306/mydb");
+//   let rs = conn.query("SELECT id, name FROM users", List<DbValue>());
+//
+// The wire CODEC (framing, lenenc, packet decode) is pure over byte buffers and gated offline;
+// the auth scramble is golden-verified. NOTE: not yet live-verified end-to-end (no MySQL server
+// was available) - the connect/query flow follows the spec but is unproven live.
+import net.aio;
+import net.asynctls;
+import io.file;
+import bytes;
+import string;
+import list;
+import db;
+import connection;
+import codec;
+import typemap;
+import proto;
+import stmt;
+import auth;
+
+// --- The driver interface implementation ----------------------------------------------
+
+// The result of rewriting the parameter-placeholder-style `$N` to MySQL-native `?` for COM_STMT_PREPARE,
+// with the params reordered into placeholder-appearance order (handles reuse / out-of-order $N).
+struct ConvQ {
+    pub sql: string,
+    pub params: List<DbValue>,
+    init(sql: string, params: List<DbValue>) { self.sql = sql; self.params = params; }
+}
+// Rewrite `$N` placeholders to MySQL-native `?`, reordering params into appearance order. The scanner
+// is literal- and comment-aware: a `$N` (or stray `?`) inside a single- or double-quoted string literal,
+// a backtick-quoted identifier, a `-- ` / `#` line comment, or a `/* ... */` block comment is copied
+// through untouched and never consumes a param slot. This stops `'cost is $5'` being corrupted into a
+// bind placeholder and miscounting the params. Outside literals behaviour is unchanged.
+pub fn convertDollarParams(sql: string, params: List<DbValue>): ConvQ {
+    let out = "";
+    let np = List<DbValue>();
+    let i = 0;
+    let n = sql.length;
+    while (i < n) {
+        let c = sql[i];
+        // Quoted string literal (') / (") or backtick-quoted identifier (`): copy verbatim to the close.
+        if (c == 39 || c == 34 || c == 96) {
+            out = out + string.slice(sql, i, i + 1);   // opening quote
+            let quote = c;
+            i = i + 1;
+            while (i < n) {
+                let d = sql[i];
+                // Backslash escape (not inside backtick identifiers): copy the backslash and the next byte.
+                if (d == 92 && quote != 96 && i + 1 < n) {
+                    out = out + string.slice(sql, i, i + 2);
+                    i = i + 2;
+                    continue;
+                }
+                if (d == quote) {
+                    // A doubled quote is an escaped quote, not the end of the literal.
+                    if (i + 1 < n && sql[i + 1] == quote) {
+                        out = out + string.slice(sql, i, i + 2);
+                        i = i + 2;
+                        continue;
+                    }
+                    out = out + string.slice(sql, i, i + 1);   // closing quote
+                    i = i + 1;
+                    break;
+                }
+                out = out + string.slice(sql, i, i + 1);
+                i = i + 1;
+            }
+            continue;
+        }
+        // Line comment: `-- ` (double dash + whitespace) or `#`, to end of line.
+        if ((c == 45 && i + 2 < n && sql[i + 1] == 45 && (sql[i + 2] == 32 || sql[i + 2] == 9)) || c == 35) {
+            while (i < n && sql[i] != 10) { out = out + string.slice(sql, i, i + 1); i = i + 1; }
+            continue;
+        }
+        // Block comment: `/* ... */`.
+        if (c == 47 && i + 1 < n && sql[i + 1] == 42) {
+            out = out + "/*";
+            i = i + 2;
+            while (i < n) {
+                if (sql[i] == 42 && i + 1 < n && sql[i + 1] == 47) { out = out + "*/"; i = i + 2; break; }
+                out = out + string.slice(sql, i, i + 1);
+                i = i + 1;
+            }
+            continue;
+        }
+        if (c == 36 && i + 1 < n && sql[i + 1] >= 48 && sql[i + 1] <= 57) {   // `$` + digit
+            let j = i + 1;
+            let num = 0;
+            while (j < n && sql[j] >= 48 && sql[j] <= 57) { num = num * 10 + (sql[j] - 48); j = j + 1; }
+            out = out + "?";
+            np.push(params.get(num - 1) ?? db.dbNull());
+            i = j;
+        } else {
+            out = out + string.slice(sql, i, i + 1);
+            i = i + 1;
+        }
+    }
+    return ConvQ(out, np);
+}
+
+pub struct MyConnection impl Connection {
+    pub io: aio.AsyncIO,
+    pub reader: MyReader,
+    pub stmts: List<MyStmt>,   // D6: server-side prepared-statement cache (COM_STMT_*)
+    // Stable, non-aliasing handles for the prepared-statement cache, parallel to `stmts` (handles[k] is
+    // the handle of stmts[k]). `prepare` returns one of these, never a positional index, and `nextHandle`
+    // only ever increases - so an evicted/flushed handle is never reused by a later prepare and a stale
+    // handle locates nothing (a located error) instead of silently aliasing a different statement.
+    pub handles: List<int>,
+    pub nextHandle: int,       // monotonically increasing; the next handle to hand out (never reused)
+    pub busy: bool,   // concurrency guard: one in-flight request per connection
+    pub connId: int,  // T8: server's thread id (from the handshake) - the KILL QUERY target
+    pub connectionString: string,  // T8: the DSN so cancel() can open a SEPARATE side connection
+    pub failed: bool,             // set when connect failed closed (e.g. TLS verify failed under require)
+    pub failErr: string,          // the failure reason surfaced to the first query/exec
+    pub inTx: bool,               // true between begin() and commit()/rollback() - a pool uses it to detect
+                                  // a connection returned mid-transaction so it can reset before reuse
+    pub resetPending: bool,       // a pool set this on release; reset() clears the session state server-side
+    init(io: aio.AsyncIO, reader: MyReader) {
+        self.io = io;
+        self.reader = reader;
+        self.stmts = List<MyStmt>();
+        self.handles = List<int>();
+        self.nextHandle = 1;   // 0 is reserved as the "no handle" sentinel
+        self.busy = false;
+        self.connId = 0;
+        self.connectionString = "";
+        self.failed = false;
+        self.failErr = "";
+        self.inTx = false;
+        self.resetPending = false;
+    }
+    // Translate a stable prepared-statement handle to its current index in `stmts`, or -1 if the handle
+    // is unknown (never issued, or evicted by a cache flush). Lookups go through this so a stale handle
+    // can be reported as a located error rather than silently running a different cached statement.
+    fn stmtIndex(self, handle: int): int {
+        let k = 0;
+        while (k < self.handles.size()) {
+            if ((self.handles.get(k) ?? 0) == handle) { return k; }
+            k = k + 1;
+        }
+        return -1;
+    }
+    pub fn markFailed(self, why: string): void { self.failed = true; self.failErr = why; }
+
+    // T8 query cancellation. MySQL cancels an in-flight query by opening a SEPARATE connection and
+    // running `KILL QUERY <connection_id>` (the running connection is blocked on the server, so the
+    // kill must arrive on another socket). `cancelSql` is the pure statement; `cancel` opens the side
+    // connection to the same host/connection string and executes it. Live step: needs a reachable MySQL server.
+    pub fn cancelSql(self): string { return codec.buildKillQuery(self.connId); }
+    pub async fn cancel(self): ExecResult {
+        let side = await myConnectAsync(self.connectionString);
+        let r = await side.exec(self.cancelSql(), List<DbValue>());
+        side.close();
+        return r;
+    }
+
+    pub async fn query(self, sql: string, params: List<DbValue>): ResultSet {
+        if (self.failed) { return errorResult(DbError("", self.failErr)); }
+        if (self.busy) { return errorResult(DbError("", "connection busy: concurrent use")); }
+        self.busy = true;
+        // SECURITY: with params, bind them SERVER-SIDE via a prepared statement (COM_STMT_EXECUTE)
+        // instead of interpolating into SQL text -- injection is then structurally impossible.
+        // No-param SQL keeps the plain COM_QUERY path (multi-statement / DDL).
+        if (params.size() > 0) {
+            let cq = convertDollarParams(sql, params);
+            let rs = await self.runBound(cq.sql, cq.params);
+            self.busy = false;
+            return rs;
+        }
+        await proto.sendPacket(self.io, codec.buildComQuery(sql));
+        let rs = ResultSet();
+        // T14 Feature 1: multi-resultset. A multi-statement query or stored procedure yields several
+        // result sets back-to-back; each terminating OK/EOF sets SERVER_MORE_RESULTS_EXISTS (0x0008)
+        // when another follows. Loop until a terminating packet clears that bit, consuming ALL result
+        // sets so the connection is never left mid-stream; `rs` holds the LAST result set.
+        let more = true;
+        while (more) {
+            more = false;
+            let first = await proto.readPacket(self.reader);
+            if (!first.ok) { rs.err = DbError("", "connection read failed"); self.busy = false; return rs; }
+            if (codec.isErr(first.payload)) { rs.err = codec.decodeErr(first.payload); self.busy = false; return rs; }
+            if (codec.isLocalInfile(first.payload)) {
+                // The server asked us to stream a local file (LOAD DATA LOCAL INFILE). We do not
+                // support it; send an empty file body so the server finishes the request cleanly (an
+                // OK/ERR follows), then surface an error instead of desyncing the row stream.
+                await proto.sendPacket(self.io, codec.buildEmptyPacket(first.seq + 1));
+                let fin = await proto.readPacket(self.reader);
+                if (codec.isErr(fin.payload)) { rs.err = codec.decodeErr(fin.payload); }
+                else { rs.err = DbError("", "LOAD DATA LOCAL INFILE is not supported by this driver"); }
+                self.busy = false;
+                return rs;
+            }
+            if (codec.isOk(first.payload)) {
+                // A resultset-less statement (INSERT/UPDATE/DDL inside a multi-statement run).
+                let ok = ResultSet();
+                ok.rows_affected = codec.okAffectedRows(first.payload);
+                rs = ok;
+                more = codec.moreResultsExists(codec.okStatusFlags(first.payload));
+            } else {
+                // first.payload = column_count (lenenc).
+                let cur = ResultSet();
+                let cc = codec.MyCursor(first.payload);
+                let ncols = cc.lenenc();
+                let i = 0;
+                while (i < ncols) {
+                    let cp = await proto.readPacket(self.reader);
+                    if (!cp.ok) { rs = cur; self.busy = false; return rs; }
+                    cur.columns.push(codec.decodeColumnDef(cp.payload));
+                    i = i + 1;
+                }
+                // EOF after column defs.
+                let eof1 = await proto.readPacket(self.reader);
+                // Rows until EOF (an ERR here is a mid-result failure -- surface it). The terminating
+                // EOF's status flags decide whether a further result set follows.
+                let termFlags = 0;
+                while (true) {
+                    let rp = await proto.readPacket(self.reader);
+                    if (!rp.ok) { break; }
+                    if (codec.isErr(rp.payload)) { cur.err = codec.decodeErr(rp.payload); break; }
+                    if (codec.isEof(rp.payload)) { termFlags = codec.eofStatusFlags(rp.payload); break; }
+                    cur.rows.push(codec.decodeTextRow(rp.payload, cur.columns));
+                }
+                cur.rows_affected = cur.rows.size();
+                cur.tag = `SELECT ${cur.rows.size()}`;
+                rs = cur;
+                more = codec.moreResultsExists(termFlags);
+            }
+        }
+        self.busy = false;
+        return rs;
+    }
+
+    // Connection trait: the buffer->struct read. MySQL has no zero-materialisation wire override yet, so use
+    // the generic fallback (materialise via query(), then re-encode into WireRows' canonical layout). This
+    // is what `db.query<T>` calls; without it MyConnection did not satisfy the Connection trait.
+    pub async fn queryWire(self, sql: string, params: List<DbValue>): WireRows {
+        return db.wireRowsFromResultSet(await self.query(sql, params));
+    }
+
+    pub async fn exec(self, sql: string, params: List<DbValue>): ExecResult {
+        if (self.failed) { return errorExec(DbError("", self.failErr)); }
+        if (self.busy) { return errorExec(DbError("", "connection busy: concurrent use")); }
+        self.busy = true;
+        // Same server-bound-param path as query() (see the SECURITY note there).
+        if (params.size() > 0) {
+            let cq = convertDollarParams(sql, params);
+            let rs = await self.runBound(cq.sql, cq.params);
+            self.busy = false;
+            if (!rs.err.isEmpty()) { return errorExec(rs.err); }
+            return ExecResult(rs.rows_affected, "OK");
+        }
+        await proto.sendPacket(self.io, codec.buildComQuery(sql));
+        let p = await proto.readPacket(self.reader);
+        if (!p.ok) { self.busy = false; return errorExec(DbError("", "connection read failed")); }
+        if (codec.isErr(p.payload)) { self.busy = false; return errorExec(codec.decodeErr(p.payload)); }
+        if (codec.isOk(p.payload)) { self.busy = false; return ExecResult(codec.okAffectedRows(p.payload), "OK"); }
+        // A result set slipped through (a SELECT run via exec()). The first packet is a result-set header
+        // (column_count), NOT an OK/ERR, so we MUST drain the column-definition + row + terminating
+        // EOF/OK packets of this (and any further) result set to leave the socket at a clean boundary.
+        // Skipping the drain poisoned a pooled connection: the next borrower mis-framed the stream.
+        let hdr = p;
+        while (true) {
+            if (codec.isErr(hdr.payload)) { self.busy = false; return errorExec(codec.decodeErr(hdr.payload)); }
+            let flags = 0;
+            if (codec.isOk(hdr.payload)) {
+                // A resultset-less statement inside a multi-statement batch.
+                flags = codec.okStatusFlags(hdr.payload);
+            } else {
+                // Result-set header: column_count(lenenc), column defs, EOF, rows until EOF/ERR.
+                let cc = codec.MyCursor(hdr.payload);
+                let ncols = cc.lenenc();
+                let i = 0;
+                while (i < ncols) { let cp = await proto.readPacket(self.reader); i = i + 1; }
+                let eofc = await proto.readPacket(self.reader);
+                let derr = noError();
+                while (true) {
+                    let rp = await proto.readPacket(self.reader);
+                    if (!rp.ok) { self.busy = false; return errorExec(DbError("", "connection read failed")); }
+                    if (codec.isErr(rp.payload)) { derr = codec.decodeErr(rp.payload); break; }
+                    if (codec.isEof(rp.payload)) { flags = codec.eofStatusFlags(rp.payload); break; }
+                }
+                if (!derr.isEmpty()) { self.busy = false; return errorExec(derr); }
+            }
+            if (!codec.moreResultsExists(flags)) { break; }
+            hdr = await proto.readPacket(self.reader);
+            if (!hdr.ok) { self.busy = false; return errorExec(DbError("", "connection read failed")); }
+        }
+        self.busy = false;
+        return ExecResult(0, "OK");
+    }
+
+    pub fn close(self): void {
+        // sync trait method: close the socket (a graceful COM_QUIT would need an async send;
+        // an abrupt close is fine for teardown).
+        self.io.close();
+        // Free the 64 KB read buffer explicitly. The MyReader destructor frees it too, but a pooled or
+        // trait-held connection is not reliably dropped, so close is the teardown that actually runs.
+        // Guarded (buf set to 0) so the destructor and a double close are both no-ops afterwards.
+        if (self.reader.buf != 0) {
+            bytes.free(self.reader.buf);
+            self.reader.buf = 0;
+        }
+    }
+
+    // Transaction control (BEGIN is a MySQL alias for START TRANSACTION). `inTx` tracks whether a
+    // transaction is open so a pool can detect a connection handed back mid-transaction and reset it.
+    pub async fn begin(self): ExecResult {
+        let r = await self.exec("BEGIN", List<DbValue>());
+        if (r.ok()) { self.inTx = true; }
+        return r;
+    }
+    pub async fn commit(self): ExecResult {
+        let r = await self.exec("COMMIT", List<DbValue>());
+        self.inTx = false;
+        return r;
+    }
+    pub async fn rollback(self): ExecResult {
+        let r = await self.exec("ROLLBACK", List<DbValue>());
+        self.inTx = false;
+        return r;
+    }
+
+    // True when a transaction is open (begin() without a matching commit()/rollback()). A pool checks this
+    // on release to detect a connection returned mid-transaction so it can reset() before reuse.
+    pub fn isInTransaction(self): bool { return self.inTx; }
+
+    // Pool reset hook (the MySQL analogue of MSSQL's markForReset()/RESETCONNECTION). A pool calls this
+    // when a reused connection is handed back; the next reset() clears session state server-side.
+    pub fn markForReset(self): void { self.resetPending = true; }
+
+    // Reset the session state without reconnecting: COM_RESET_CONNECTION rolls back any open transaction
+    // and clears SET options, temporary tables, user variables, and server-side prepared statements, so no
+    // txn/session state leaks to the next borrower. A pool calls this on release (unconditionally, or when
+    // isInTransaction() reveals a begin-without-commit). Clears the local prepared-statement cache too,
+    // since the server dropped those statements. Safe to call when idle; returns the server's OK/ERR.
+    pub async fn reset(self): ExecResult {
+        if (self.failed) { return errorExec(DbError("", self.failErr)); }
+        if (self.busy) { return errorExec(DbError("", "connection busy: concurrent use")); }
+        self.busy = true;
+        await proto.sendPacket(self.io, codec.buildResetConnection());
+        let p = await proto.readPacket(self.reader);
+        self.inTx = false;
+        self.resetPending = false;
+        self.stmts = List<MyStmt>();     // the server dropped all prepared statements
+        self.handles = List<int>();      // so the stale handles must not resolve (nextHandle keeps growing)
+        if (!p.ok) { self.busy = false; return errorExec(DbError("", "connection read failed")); }
+        if (codec.isErr(p.payload)) { self.busy = false; return errorExec(codec.decodeErr(p.payload)); }
+        self.busy = false;
+        return ExecResult(0, "OK");
+    }
+
+    pub fn setTimeout(self, ms: int): int {   // D6 - async per-recv awaited deadline
+        return self.io.setTimeout(ms);
+    }
+
+    // D6 prepared statements - REAL server-side (COM_STMT_PREPARE / COM_STMT_EXECUTE, binary
+    // protocol). `prepare` parses the SQL once server-side and caches its id + result-column
+    // metadata (deduped by SQL); `queryPrepared`/`execPrepared` bind params + run it.
+    //
+    // The returned handle is a STABLE, monotonically allocated id (never a positional index and never
+    // reused), so it survives the cache flush below without aliasing a different statement: an evicted
+    // handle simply stops resolving and yields a located error rather than silently running the wrong SQL.
+    pub async fn prepare(self, sql: string): int {
+        let d = 0;
+        while (d < self.stmts.size()) {
+            let s = self.stmts.get(d) ?? MyStmt(0, "", List<Column>(), List<int>(), 0);
+            if (string.eql(s.sql, sql)) { return self.handles.get(d) ?? 0; }
+            d = d + 1;
+        }
+        // Bound the server-side prepared-statement cache. A long-lived pooled connection that runs
+        // many DISTINCT ad-hoc SQL strings would otherwise accumulate one server-side statement each,
+        // forever (COM_STMT_CLOSE was never sent) - a slow server-memory leak. When the cache is full,
+        // free every cached statement with COM_STMT_CLOSE (no reply) and start fresh. Because `nextHandle`
+        // keeps increasing across the flush, the handles returned before the flush are NOT reassigned to
+        // the new statements - a stale handle locates nothing instead of aliasing a live one.
+        if (self.stmts.size() >= 256) {
+            let k = 0;
+            while (k < self.stmts.size()) {
+                let old = self.stmts.get(k) ?? MyStmt(0, "", List<Column>(), List<int>(), 0);
+                if (old.id > 0) { await proto.sendPacket(self.io, codec.buildStmtClose(old.id)); }
+                k = k + 1;
+            }
+            self.stmts = List<MyStmt>();
+            self.handles = List<int>();
+        }
+        await proto.sendPacket(self.io, codec.buildStmtPrepare(sql));
+        let ok = await proto.readPacket(self.reader);
+        // COM_STMT_PREPARE_OK: 0x00, stmt_id(4), num_columns(2), num_params(2), 0x00, warnings(2).
+        if (!ok.ok || codec.isErr(ok.payload)) { return -1; }
+        let oc = codec.MyCursor(ok.payload);
+        oc.skip(1);
+        let stmtId = oc.u32();
+        let numCols = oc.u16();
+        let numParams = oc.u16();
+        // Param definition packets (numParams) + EOF, then column defs (numCols) + EOF. This
+        // build does not set CLIENT_DEPRECATE_EOF, so the EOF packets are present.
+        let pi = 0;
+        while (pi < numParams) { let pp = await proto.readPacket(self.reader); pi = pi + 1; }
+        if (numParams > 0) { let e1 = await proto.readPacket(self.reader); }
+        let cols = List<Column>();
+        let colTypes = List<int>();
+        let ci = 0;
+        while (ci < numCols) {
+            let cp = await proto.readPacket(self.reader);
+            cols.push(codec.decodeColumnDef(cp.payload));
+            colTypes.push(codec.columnTypeRaw(cp.payload));
+            ci = ci + 1;
+        }
+        if (numCols > 0) { let e2 = await proto.readPacket(self.reader); }
+        let handle = self.nextHandle;
+        self.nextHandle = self.nextHandle + 1;
+        self.stmts.push(MyStmt(stmtId, sql, cols, colTypes, numParams));
+        self.handles.push(handle);
+        return handle;
+    }
+
+    pub async fn queryPrepared(self, stmt: int, params: List<DbValue>): ResultSet {
+        if (self.busy) { return errorResult(DbError("", "connection busy: concurrent use")); }
+        let idx = self.stmtIndex(stmt);
+        // A bad or stale handle is a LOCATED error (populated err), not an empty success - so a caller
+        // can tell "unknown prepared statement" apart from "a valid statement that returned zero rows".
+        if (idx < 0) { return errorResult(DbError("", `mysql: unknown or evicted prepared-statement handle ${stmt}`)); }
+        self.busy = true;
+        let s = self.stmts.get(idx) ?? MyStmt(0, "", List<Column>(), List<int>(), 0);
+        let rs = await self.execStmtRaw(s, params);
+        self.busy = false;
+        return rs;
+    }
+    // Run COM_STMT_EXECUTE for an already-prepared statement and decode the binary result set. Does NOT
+    // touch the busy guard (the caller owns it), so both queryPrepared and query()'s server-bound-param
+    // path can share it. Params are bound in the EXECUTE packet -- never interpolated into SQL.
+    async fn execStmtRaw(self, s: MyStmt, params: List<DbValue>): ResultSet {
+        let rs = ResultSet();
+        await proto.sendPacket(self.io, codec.buildStmtExecute(s.id, params, false));
+        let first = await proto.readPacket(self.reader);
+        if (!first.ok) { rs.err = DbError("", "connection read failed"); return rs; }
+        if (codec.isErr(first.payload)) { rs.err = codec.decodeErr(first.payload); return rs; }
+        if (codec.isOk(first.payload)) { rs.rows_affected = codec.okAffectedRows(first.payload); return rs; }
+        // column_count(lenenc), then column defs + EOF, then BINARY rows until EOF.
+        let cc = codec.MyCursor(first.payload);
+        let ncols = cc.lenenc();
+        let cols = List<Column>();
+        let colTypes = List<int>();
+        let i = 0;
+        while (i < ncols) {
+            let cp = await proto.readPacket(self.reader);
+            cols.push(codec.decodeColumnDef(cp.payload));
+            colTypes.push(codec.columnTypeRaw(cp.payload));
+            i = i + 1;
+        }
+        rs.columns = cols;
+        let eof1 = await proto.readPacket(self.reader);
+        // SYNC row loop (parity with the Postgres driver's tryFrame): parse each fully-buffered row packet
+        // WITHOUT awaiting, filling the reader ring only when it runs dry. A 200-row result now costs ~one
+        // await per socket read instead of one coroutine suspension per row (~200 -> ~4). Same classification
+        // and same lazy decodeBinaryRow as before -- only the framing became synchronous.
+        while (true) {
+            let pk = proto.tryPacket(self.reader);
+            if (pk.status == -2) { if (!(await proto.fillReader(self.reader))) { break; } continue; }
+            if (pk.status == -3) {                                    // >=16MB continuation row: async fallback
+                let rp = await proto.readPacket(self.reader);
+                if (!rp.ok) { break; }
+                if (codec.isErr(rp.payload)) { rs.err = codec.decodeErr(rp.payload); break; }
+                if (codec.isEof(rp.payload)) { break; }
+                rs.rows.push(codec.decodeBinaryRow(rp.payload, rs.columns, colTypes));
+                continue;
+            }
+            if (pk.status != 0) { break; }
+            let payload = proto.pktStr(self.reader, pk.off, pk.len);
+            if (codec.isErr(payload)) { rs.err = codec.decodeErr(payload); break; }
+            if (codec.isEof(payload)) { break; }
+            rs.rows.push(codec.decodeBinaryRow(payload, rs.columns, colTypes));
+        }
+        rs.rows_affected = rs.rows.size();
+        rs.tag = `SELECT ${rs.rows.size()}`;
+        return rs;
+    }
+    // Ensure `sql` (already `?`-placeholdered) is prepared and run it with `params` bound server-side.
+    // Assumes the caller holds the busy guard.
+    async fn runBound(self, sql: string, params: List<DbValue>): ResultSet {
+        let h = await self.prepare(sql);
+        if (h < 0) { let rs = ResultSet(); rs.err = DbError("", "prepare failed"); return rs; }
+        let idx = self.stmtIndex(h);
+        if (idx < 0) { let rs = ResultSet(); rs.err = DbError("", "prepare failed"); return rs; }
+        let s = self.stmts.get(idx) ?? MyStmt(0, "", List<Column>(), List<int>(), 0);
+        return await self.execStmtRaw(s, params);
+    }
+
+    pub async fn execPrepared(self, stmt: int, params: List<DbValue>): ExecResult {
+        if (self.busy) { return errorExec(DbError("", "connection busy: concurrent use")); }
+        let idx = self.stmtIndex(stmt);
+        // Located error for a bad/stale handle (see queryPrepared) - not a silent empty-success ExecResult.
+        if (idx < 0) { return errorExec(DbError("", `mysql: unknown or evicted prepared-statement handle ${stmt}`)); }
+        self.busy = true;
+        let s = self.stmts.get(idx) ?? MyStmt(0, "", List<Column>(), List<int>(), 0);
+        await proto.sendPacket(self.io, codec.buildStmtExecute(s.id, params, false));
+        let p = await proto.readPacket(self.reader);
+        if (!p.ok) { self.busy = false; return errorExec(DbError("", "connection read failed")); }
+        if (codec.isErr(p.payload)) { self.busy = false; return errorExec(codec.decodeErr(p.payload)); }
+        if (codec.isOk(p.payload)) { self.busy = false; return ExecResult(codec.okAffectedRows(p.payload), "OK"); }
+        // A result set (SELECT via execPrepared): drain column defs + rows to keep the stream aligned.
+        let cc = codec.MyCursor(p.payload);
+        let ncols = cc.lenenc();
+        let i = 0;
+        while (i < ncols) { let cp = await proto.readPacket(self.reader); i = i + 1; }
+        let eof1 = await proto.readPacket(self.reader);
+        let derr = noError();
+        while (true) {
+            let rp = await proto.readPacket(self.reader);
+            if (!rp.ok) { break; }
+            if (codec.isErr(rp.payload)) { derr = codec.decodeErr(rp.payload); break; }
+            if (codec.isEof(rp.payload)) { break; }
+        }
+        if (!derr.isEmpty()) { self.busy = false; return errorExec(derr); }
+        self.busy = false;
+        return ExecResult(0, "OK");
+    }
+
+    // --- X4: true streaming via a server-side read-only cursor ----------------
+    // Stream a query's rows in server-fetched batches (COM_STMT_EXECUTE with CURSOR_TYPE_READ_ONLY, then
+    // COM_STMT_FETCH(batchSize) until the terminating EOF sets SERVER_STATUS_LAST_ROW_SENT). The server
+    // keeps the result set on its side and yields `batchSize` rows per fetch, so a large table never
+    // buffers in full. Iterate:
+    //   let cur = await conn.queryStream("SELECT ...", params, 500);
+    //   while (let row = await cur.next()) { ... }
+    //   let _ = await cur.close();
+    // batchSize <= 0 defaults to 100. The connection stays busy until the cursor is drained or closed.
+    pub async fn queryStream(self, sql: string, params: List<DbValue>, batchSize: int): Cursor {
+        if (self.failed) { return cursorOver(errorResult(DbError("", self.failErr))); }
+        if (self.busy) { return cursorOver(errorResult(DbError("", "connection busy: concurrent use"))); }
+        self.busy = true;
+        let bs = if (batchSize > 0) batchSize else 100;
+        let cq = convertDollarParams(sql, params);
+        let h = await self.prepare(cq.sql);
+        if (h < 0) { self.busy = false; return cursorOver(errorResult(DbError("", "prepare failed"))); }
+        let idx = self.stmtIndex(h);
+        if (idx < 0) { self.busy = false; return cursorOver(errorResult(DbError("", "prepare failed"))); }
+        let s = self.stmts.get(idx) ?? MyStmt(0, "", List<Column>(), List<int>(), 0);
+        await proto.sendPacket(self.io, codec.buildStmtExecute(s.id, cq.params, true));   // open a read-only cursor
+        let first = await proto.readPacket(self.reader);
+        if (!first.ok) { self.busy = false; return cursorOver(errorResult(DbError("", "connection read failed"))); }
+        if (codec.isErr(first.payload)) { let e = codec.decodeErr(first.payload); self.busy = false; return cursorOver(errorResult(e)); }
+        if (codec.isOk(first.payload)) { self.busy = false; return cursorOver(ResultSet()); }   // no result set
+        // column_count(lenenc), then column defs, then the cursor-open EOF (SERVER_STATUS_CURSOR_EXISTS).
+        let cc = codec.MyCursor(first.payload);
+        let ncols = cc.lenenc();
+        let cols = List<Column>();
+        let colTypes = List<int>();
+        let i = 0;
+        while (i < ncols) {
+            let cp = await proto.readPacket(self.reader);
+            cols.push(codec.decodeColumnDef(cp.payload));
+            colTypes.push(codec.columnTypeRaw(cp.payload));
+            i = i + 1;
+        }
+        let eof1 = await proto.readPacket(self.reader);
+        let src: RowBatchSource = MyRowSource(self, s.id, cols, colTypes, bs);
+        return Cursor(src);
+    }
+}
+
+// A lazy row source over a MySQL server-side read-only cursor: each fetchBatch issues COM_STMT_FETCH for
+// `batchSize` rows and decodes the binary row packets until the batch's EOF. When that EOF carries
+// SERVER_STATUS_LAST_ROW_SENT (0x0080) the cursor is exhausted (MySQL closes it server-side); an early
+// close() sends COM_STMT_RESET to discard the rest without leaking the cursor.
+pub struct MyRowSource impl RowBatchSource {
+    pub conn: MyConnection,
+    pub stmtId: int,
+    pub cols: List<Column>,
+    pub colTypes: List<int>,
+    pub batchSize: int,
+    pub done: bool,
+    pub e: DbError,
+    init(conn: MyConnection, stmtId: int, cols: List<Column>, colTypes: List<int>, batchSize: int) {
+        self.conn = conn; self.stmtId = stmtId; self.cols = cols; self.colTypes = colTypes;
+        self.batchSize = batchSize; self.done = false; self.e = noError();
+    }
+
+    async fn fetchBatch(self: MyRowSource): List<Row> {
+        let rows = List<Row>();
+        if (self.done) { return rows; }
+        await proto.sendPacket(self.conn.io, codec.buildStmtFetch(self.stmtId, self.batchSize));
+        while (true) {
+            let rp = await proto.readPacket(self.conn.reader);
+            if (!rp.ok) { self.done = true; self.conn.busy = false; break; }
+            if (codec.isErr(rp.payload)) { self.e = codec.decodeErr(rp.payload); self.done = true; self.conn.busy = false; break; }
+            if (codec.isEof(rp.payload)) {
+                // The fetch's terminating EOF: LAST_ROW_SENT means the whole result has been read.
+                if ((codec.eofStatusFlags(rp.payload) & 0x0080) != 0) { self.done = true; self.conn.busy = false; }
+                break;
+            }
+            rows.push(codec.decodeBinaryRow(rp.payload, self.cols, self.colTypes));
+        }
+        return rows;
+    }
+    fn columns(self: MyRowSource): List<Column> { return self.cols; }
+    fn err(self: MyRowSource): DbError { return self.e; }
+    async fn close(self: MyRowSource): void {
+        if (!self.done) {
+            await proto.sendPacket(self.conn.io, codec.buildStmtReset(self.stmtId));   // discard the open cursor
+            let _rp = await proto.readPacket(self.conn.reader);                          // OK
+            self.done = true;
+            self.conn.busy = false;
+        }
+    }
+}
+
+/// Connect and return the CONCRETE MyConnection (so callers can reach queryStream and any mysql-specific
+/// helpers). Driver.connect returns the Connection trait; this is the mysql analogue of mongodb.open.
+pub async fn open(connectionString: string): MyConnection {
+    return await myConnectAsync(connectionString);
+}
+
+/// The MySQL driver. connection string: `mysql://user[:password]@host[:port]/database`. Reads the server
+/// Handshake, computes the auth response (native_password SHA1, or caching_sha2 fast SHA256),
+/// sends HandshakeResponse41, and expects an OK packet.
+// Whole connect + auth handshake as ONE async fn, driven once by the sync Driver.connect.
+async fn myConnectAsync(connectionString: string): MyConnection {
+        let d = connection.parse(connectionString);
+        let stream = await aio.asyncConnectDeadline(d.host, d.port, connection.connectTimeoutMs(connectionString));
+        let reader = MyReader(stream);
+        if (!stream.ok()) {
+            let dead = MyConnection(stream, reader);
+            dead.markFailed("connect timed out or refused: " + d.host + ":" + `${d.port}`);
+            return dead;
+        }
+
+        let hp = await proto.readPacket(reader);
+        let hs = codec.parseHandshake(hp.payload);
+
+        // Compute the scramble for the server's chosen auth plugin. An EMPTY password
+        // MUST send an empty scramble (a 0-length auth response) - the server then
+        // fast-accepts an empty-password account; a computed 32-byte scramble would
+        // fail auth.
+        let scramble = "";
+        if (d.password.length > 0) {
+            if (string.eql(hs.plugin, "caching_sha2_password")) {
+                scramble = auth.mysqlSha2Scramble(d.password, hs.salt);
+            } else {
+                scramble = auth.mysqlNativeScramble(d.password, hs.salt);
+            }
+        }
+
+        // STARTTLS: when sslmode is set, run TLS between the server Handshake and the
+        // HandshakeResponse. SSLRequest = the first 32 bytes of the response with CLIENT_SSL set (seq 1);
+        // then the socket is upgraded and the full response is sent over TLS (seq 2). Passing the
+        // concrete stream into myAuthFinish's AsyncIO param is a widening (the safe direction).
+        if (string.eql(d.sslmode, "disable")) {
+            await proto.sendPacket(stream, codec.buildHandshakeResponse(d.user, d.database, scramble, hs.plugin));
+            return await myAuthFinish(stream, reader, d, hs.salt, hs.connId, connectionString, false);
+        }
+        let sslCaps = auth.clientCapabilities() + codec.CLIENT_SSL;
+        await proto.sendPacket(stream, codec.buildSSLRequest(sslCaps, hp.seq + 1));
+        // TLS trust policy. `skip-verify` is the ONLY mode that encrypts without validating the server
+        // certificate; `require`/`verify-ca`/`verify-full` all verify the chain against the CA bundle
+        // (sslrootcert) and FAIL CLOSED if it does not validate. Previously `require` silently used the
+        // no-verify path -- a MITM with any cert defeated it, so it was a trust downgrade.
+        let tlsToMs = connection.connectTimeoutMs(connectionString);
+        if (!string.eql(d.sslmode, "skip-verify")) {
+            let caPem = if (d.sslrootcert != "") File.readText(d.sslrootcert) else "";
+            let ts = await asynctls.tlsClientUpgradeVerifyDeadline(stream, d.host, caPem, tlsToMs);
+            if (!ts.ok()) {
+                let dead = MyConnection(ts, reader);
+                dead.markFailed("mysql: TLS certificate verification failed for sslmode=" + d.sslmode + " (set sslrootcert, or use sslmode=skip-verify to opt out)");
+                return dead;
+            }
+            reader.io = ts;
+            await proto.sendPacket(ts, codec.buildHandshakeResponseFull(d.user, d.database, scramble, hs.plugin, sslCaps, hp.seq + 2));
+            return await myAuthFinish(ts, reader, d, hs.salt, hs.connId, connectionString, true);
+        }
+        let ts2 = await asynctls.tlsClientUpgradeDeadline(stream, d.host, tlsToMs);   // skip-verify: encrypt, no validation
+        reader.io = ts2;
+        await proto.sendPacket(ts2, codec.buildHandshakeResponseFull(d.user, d.database, scramble, hs.plugin, sslCaps, hp.seq + 2));
+        return await myAuthFinish(ts2, reader, d, hs.salt, hs.connId, connectionString, true);
+}
+
+// The post-response auth flow (auth-result, AuthSwitch, caching_sha2 full-auth) over `io` (plaintext
+// AsyncStream or an upgraded TlsStream, both AsyncIO). `reader` reads the responses; its transport was
+// pointed at `io` by the caller before the TLS path invoked this.
+async fn myAuthFinish(io: aio.AsyncIO, reader: MyReader, d: ConnectionOptions, initSalt: string, connId: int, connectionString: string, secure: bool): MyConnection {
+        // `activeSalt` is the nonce the current auth response was computed against - the RSA full-auth
+        // path XORs the password with it, so it must track any AuthSwitch.
+        let activeSalt = initSalt;
+        let ar = await proto.readPacket(reader);
+
+        // AuthSwitchRequest (0xfe): the server names the plugin it wants + a fresh 20-byte salt;
+        // re-scramble against THAT and reply (seq+1). MySQL 8/9 sends this for caching_sha2_password.
+        if (ar.payload.length > 0 && bytes.read_byte(ar.payload, 0) == 254) {
+            let sc = codec.MyCursor(ar.payload);
+            sc.skip(1);
+            let swPlugin = sc.cstr();
+            let swSalt = sc.take(20);
+            activeSalt = swSalt;
+            let sw = "";
+            if (d.password.length > 0) {
+                if (string.eql(swPlugin, "caching_sha2_password")) {
+                    sw = auth.mysqlSha2Scramble(d.password, swSalt);
+                } else {
+                    sw = auth.mysqlNativeScramble(d.password, swSalt);
+                }
+            }
+            await proto.sendPacket(io, codec.packet(ar.seq + 1, sw));
+            ar = await proto.readPacket(reader);
+        }
+
+        // caching_sha2 AuthMoreData (0x01): byte[1] selects the sub-path.
+        //   0x03 = fast-auth success -> the real OK follows.
+        //   0x04 = full auth required. Over TLS the password could go in cleartext, but sending the
+        //          RSA-encrypted password works on both transports, so keep the one path.
+        if (ar.payload.length > 1 && bytes.read_byte(ar.payload, 0) == 1) {
+            let more = bytes.read_byte(ar.payload, 1);
+            if (more == 4) {
+                // caching_sha2 full-auth: the server hands us an RSA public key and we send the password
+                // encrypted under it. Over a PLAINTEXT link that key is unauthenticated -- a MITM can
+                // substitute its own key, decrypt the reply, and recover the password. Refuse unless the
+                // channel is already TLS-secured, or the caller explicitly opted in with
+                // allowPublicKeyRetrieval=true (matching Connector/J's default-false safeguard).
+                if (!secure && !d.allowPublicKeyRetrieval) {
+                    let dead = MyConnection(io, reader);
+                    dead.markFailed("mysql: refusing caching_sha2 full-auth over a plaintext connection -- the server's RSA public key is unverified (MITM risk). Use TLS (sslmode=require/verify-ca/verify-full), or set allowPublicKeyRetrieval=true to opt in.");
+                    return dead;
+                }
+                await proto.sendPacket(io, codec.packet(ar.seq + 1, codec.u8b(2)));   // 0x02: request RSA public key
+                let pk = await proto.readPacket(reader);                   // AuthMoreData(0x01) + PEM
+                let pem = string.slice(pk.payload, 1, pk.payload.length);
+                let enc = auth.rsaEncryptPassword(d.password, activeSalt, pem);
+                await proto.sendPacket(io, codec.packet(pk.seq + 1, enc));
+                ar = await proto.readPacket(reader);                       // OK (or ERR)
+            } else {
+                ar = await proto.readPacket(reader);                       // 0x03 fast success -> real OK (or ERR)
+            }
+        }
+        // Surface a server ERR (0xff) from the auth/connect result -- bad password, unknown database, and
+        // similar all arrive here. Without this the driver returned a "live" connection that then failed
+        // confusingly on the first query (and the ERR message ran through the now-bounds-safe cursor).
+        if (ar.payload.length > 0 && bytes.read_byte(ar.payload, 0) == 255) {
+            let dead = MyConnection(io, reader);
+            dead.markFailed("mysql: " + codec.decodeErr(ar.payload).message);
+            dead.connId = connId;
+            dead.connectionString = connectionString;
+            return dead;
+        }
+        let conn = MyConnection(io, reader);
+        conn.connId = connId;   // T8: KILL QUERY target captured from the handshake
+        conn.connectionString = connectionString;         // T8: enables cancel() to open a side connection
+        return conn;
+}
+
+pub struct MyDriver impl Driver {
+    pub async fn connect(self, connectionString: string): Connection {
+        return await myConnectAsync(connectionString);   // sync trait method drives the async connect once
+    }
+}

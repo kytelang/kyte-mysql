@@ -1,0 +1,78 @@
+// T14 Feature 1 (multi-resultset) + T8 (query cancellation via KILL QUERY) - OFFLINE codec gate.
+// The live loop in `query` (read result sets while SERVER_MORE_RESULTS_EXISTS is set) and the live
+// `cancel` (open a side connection, run KILL QUERY) need a MySQL server; here we lock the PURE
+// pieces those flows are built on: the status-flag extraction + moreResultsExists predicate, the
+// KILL QUERY builder, and connection-id capture from the handshake.
+import assert;
+import bytes;
+import string;
+import list;
+import db;
+import codec;
+
+fn u16leb(v: int): string { let p = bytes.alloc(2); bytes.write_byte(p,0,v%256); bytes.write_byte(p,1,(v/256)%256); return p as string; }
+fn u32leb(v: int): string { let p = bytes.alloc(4); bytes.write_byte(p,0,v%256); bytes.write_byte(p,1,(v/256)%256); bytes.write_byte(p,2,(v/65536)%256); bytes.write_byte(p,3,(v/16777216)%256); return p as string; }
+fn b(v: int): string { let p = bytes.alloc(1); bytes.write_byte(p, 0, v); return p as string; }
+
+@test
+fn test_more_results_predicate(): void {
+    // SERVER_MORE_RESULTS_EXISTS = 0x0008.
+    assert.isTrue(codec.moreResultsExists(0x0008));
+    assert.isTrue(!codec.moreResultsExists(0));
+    // A different status bit (SERVER_STATUS_AUTOCOMMIT = 0x0002) must NOT read as "more results".
+    assert.isTrue(!codec.moreResultsExists(0x0002));
+    // Combined flags: autocommit + more-results -> true.
+    assert.isTrue(codec.moreResultsExists(0x0002 + 0x0008));
+}
+
+@test
+fn test_eof_status_flags(): void {
+    // EOF packet: 0xfe, warnings(u16), status_flags(u16). Set status = 0x0008 (more results).
+    let eof = b(254) + u16leb(0) + u16leb(0x0008);
+    assert.equalInt(codec.eofStatusFlags(eof), 0x0008);
+    assert.isTrue(codec.moreResultsExists(codec.eofStatusFlags(eof)));
+
+    // Terminating EOF with no further result set: status flags cleared of 0x0008.
+    let eofLast = b(254) + u16leb(0) + u16leb(0x0002);
+    assert.isTrue(!codec.moreResultsExists(codec.eofStatusFlags(eofLast)));
+}
+
+@test
+fn test_ok_status_flags(): void {
+    // OK packet: 0x00, affected_rows(lenenc), last_insert_id(lenenc), status_flags(u16), warnings(u16).
+    // affected=3, last_id=0, status=0x0008 (more results follow).
+    let ok = b(0) + b(3) + b(0) + u16leb(0x0008) + u16leb(0);
+    assert.equalInt(codec.okStatusFlags(ok), 0x0008);
+    assert.isTrue(codec.moreResultsExists(codec.okStatusFlags(ok)));
+
+    // Last statement of a multi-statement run: no more-results bit.
+    let okLast = b(0) + b(1) + b(0) + u16leb(0x0002) + u16leb(0);
+    assert.isTrue(!codec.moreResultsExists(codec.okStatusFlags(okLast)));
+}
+
+@test
+fn test_build_kill_query(): void {
+    // T8: KILL QUERY <connection_id> is what cancel() runs on the side connection.
+    assert.equalStr(codec.buildKillQuery(42), "KILL QUERY 42");
+    assert.equalStr(codec.buildKillQuery(1), "KILL QUERY 1");
+    assert.equalStr(codec.buildKillQuery(123456), "KILL QUERY 123456");
+}
+
+@test
+fn test_handshake_connection_id_capture(): void {
+    // Same v10 handshake shape as the codec gate, now asserting the captured 4-byte connection id.
+    let hs = b(10) + "8.0.0" + b(0) + u32leb(7) + "AAAAAAAA" + b(0)
+        + u16leb(0) + b(45) + u16leb(2) + u16leb(0)
+        + b(21) + b(0)+b(0)+b(0)+b(0)+b(0)+b(0)+b(0)+b(0)+b(0)+b(0)
+        + "BBBBBBBBBBBB" + "mysql_native_password" + b(0);
+    let h = codec.parseHandshake(hs);
+    assert.equalInt(h.connId, 7);
+    assert.equalStr(h.salt, "AAAAAAAABBBBBBBBBBBB");   // salt still correct after reading conn-id
+
+    // A larger, multi-byte connection id round-trips through the u32 read.
+    let hs2 = b(10) + "8.0.0" + b(0) + u32leb(305419896) + "AAAAAAAA" + b(0)
+        + u16leb(0) + b(45) + u16leb(2) + u16leb(0)
+        + b(21) + b(0)+b(0)+b(0)+b(0)+b(0)+b(0)+b(0)+b(0)+b(0)+b(0)
+        + "BBBBBBBBBBBB" + "mysql_native_password" + b(0);
+    assert.equalInt(codec.parseHandshake(hs2).connId, 305419896);
+}

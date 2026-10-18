@@ -1,0 +1,19 @@
+// stmt - the server-side prepared-statement cache entry (SRP: statement identity).
+// A prepared statement: server statement id, SQL (for the dedup cache), the result columns +
+// their RAW MySQL type bytes (the binary row decoder needs the exact wire type, which the db interface
+// DbType loses, TINY/SHORT/LONG all map to Int4), and the parameter count. The COM_STMT_*
+// wire frames live in codec; the prepare/queryPrepared/execPrepared orchestration lives on
+// the connection (mysql.ky). This is just the cached handle model.
+import list;
+import db;
+
+pub struct MyStmt {
+    pub id: int,
+    pub sql: string,
+    pub cols: List<Column>,
+    pub colTypes: List<int>,   // raw MySQL type | (unsigned ? 256 : 0)
+    pub numParams: int,
+    init(id: int, sql: string, cols: List<Column>, colTypes: List<int>, numParams: int) {
+        self.id = id; self.sql = sql; self.cols = cols; self.colTypes = colTypes; self.numParams = numParams;
+    }
+}

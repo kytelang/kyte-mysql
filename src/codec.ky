@@ -1,0 +1,599 @@
+// codec - the MySQL client/server wire CODEC (SRP: bytes <-> messages). Frame BUILDERS
+// (COM_QUERY, HandshakeResponse, SSLRequest, COM_STMT_*), the payload cursor (MyCursor), and
+// response DECODERS (Handshake, column def, text row, binary row, ERR/OK/EOF status). Pure over
+// byte-buffer strings - the offline gate calls these directly; the connection (mysql.ky) wires
+// them to a live stream via proto. Type interpretation is delegated to typemap; the client
+// capability flags come from auth.
+//   - packets are [payload_len:u24 LE][sequence_id:u8][payload] (not [type][len BE]);
+//   - integers/strings are LENGTH-ENCODED (lenenc), not fixed-width;
+//   - result sets are: column_count, N column-definition packets, EOF, row packets, EOF.
+import string;
+import list;
+import bytes;
+import db;
+import typemap;
+import auth;
+
+// CLIENT_SSL capability flag. Set (alongside the base flags) when the client will run the TLS
+// handshake between the server Handshake and the HandshakeResponse (STARTTLS).
+pub const CLIENT_SSL: int = 2048;
+
+// T14 Feature 1: multi-packet (>=16MB) reassembly.
+// MySQL splits a payload of length >= 0xFFFFFF across packets: a packet whose length == 0xFFFFFF is a
+// CONTINUATION marker whose successor continues the SAME logical payload; the run ends at the first
+// packet with length < 0xFFFFFF (which may be 0).
+pub const MYSQL_MAX_PACKET: int = 16777215;   // 0xFFFFFF
+
+// --- Little-endian + lenenc writers -------------------------------------------
+pub fn u8b(v: int): string { let p = bytes.alloc(1); bytes.write_byte(p, 0, v % 256); return p as string; }
+fn u16le(v: int): string {
+    let p = bytes.alloc(2);
+    bytes.write_byte(p, 0, v % 256);
+    bytes.write_byte(p, 1, (v / 256) % 256);
+    return p as string;
+}
+fn u24le(v: int): string {
+    let p = bytes.alloc(3);
+    bytes.write_byte(p, 0, v % 256);
+    bytes.write_byte(p, 1, (v / 256) % 256);
+    bytes.write_byte(p, 2, (v / 65536) % 256);
+    return p as string;
+}
+fn u32le(v: int): string {
+    let p = bytes.alloc(4);
+    bytes.write_byte(p, 0, v % 256);
+    bytes.write_byte(p, 1, (v / 256) % 256);
+    bytes.write_byte(p, 2, (v / 65536) % 256);
+    bytes.write_byte(p, 3, (v / 16777216) % 256);
+    return p as string;
+}
+fn cstr(s: string): string { return s + u8b(0); }
+// lenenc string: a length-encoded-int length + the bytes (v1 handles the < 251 length only,
+// which covers usernames and auth responses; larger payloads would use the 0xfc/fd/fe forms).
+fn lenencStr(s: string): string { return u8b(s.length) + s; }
+fn zeros(n: int): string {
+    let p = bytes.alloc(n);
+    let i = 0;
+    while (i < n) { bytes.write_byte(p, i, 0); i = i + 1; }
+    return p as string;
+}
+
+// A MySQL packet: [payload_len:u24 LE][seq:u8][payload].
+pub fn packet(seq: int, payload: string): string {
+    return u24le(payload.length) + u8b(seq) + payload;
+}
+
+// This PURE helper joins a CONTIGUOUS buffer of framed packets ([u24 len LE][seq][body]...)
+// starting at `off` into the full logical payload. readPacket applies the identical continuation
+// rule over the streaming socket reader (see proto); this helper is the offline-gated single
+// source of truth for the join rule.
+pub fn reassemblePayload(buf: string, off: int): string {
+    let out = "";
+    let p = off;
+    while (true) {
+        let a = bytes.read_byte(buf as ptr, p);
+        let b = bytes.read_byte(buf as ptr, p + 1);
+        let c = bytes.read_byte(buf as ptr, p + 2);
+        let plen = a + b * 256 + c * 65536;
+        p = p + 4;                       // skip the 3-byte length + 1-byte sequence id
+        out = out + string.slice(buf, p, p + plen);
+        p = p + plen;
+        if (plen < MYSQL_MAX_PACKET) { return out; }
+    }
+    return out;
+}
+
+/// COM_QUERY (0x03) + SQL. Sequence id resets to 0 for a new command.
+pub fn buildComQuery(sql: string): string {
+    return packet(0, u8b(3) + sql);
+}
+
+/// HandshakeResponse41: capabilities, max-packet, charset, 23 filler, user, auth response
+/// (lenenc byte + scramble), database, auth-plugin-name. Sequence id 1 (server handshake = 0).
+pub fn buildHandshakeResponse(user: string, database: string, scramble: string, plugin: string): string {
+    return buildHandshakeResponseFull(user, database, scramble, plugin, auth.clientCapabilities(), 1);
+}
+
+// Caps/seq-parameterized HandshakeResponse41. The TLS path sends this with caps | CLIENT_SSL at seq 2
+// (the SSLRequest took seq 1); the plaintext path uses the base caps at seq 1.
+pub fn buildHandshakeResponseFull(user: string, database: string, scramble: string, plugin: string, caps: int, seq: int): string {
+    let body = u32le(caps)
+        + u32le(16777216)         // max packet 16MB
+        + u8b(45)                 // charset utf8mb4_general_ci
+        + zeros(23)
+        + cstr(user)
+        + lenencStr(scramble)     // SECURE_CONNECTION: 1-byte length + scramble
+        + cstr(database)
+        + cstr(plugin);
+    return packet(seq, body);
+}
+
+// SSLRequest: the first 32 bytes of a HandshakeResponse41 (caps incl CLIENT_SSL, max-packet, charset,
+// 23 filler) and nothing else. Sent at seq 1; the TLS handshake then runs on the socket.
+pub fn buildSSLRequest(caps: int, seq: int): string {
+    let body = u32le(caps) + u32le(16777216) + u8b(45) + zeros(23);
+    return packet(seq, body);
+}
+
+// --- Payload cursor (decode, pure over a byte-buffer string) ------------------
+pub struct MyCursor {
+    pub s: string,
+    pub pos: int,
+    init(s: string) { self.s = s; self.pos = 0; }
+
+    pub fn byte(self: MyCursor): int {
+        let b = self.s[self.pos];
+        self.pos = self.pos + 1;
+        return b;
+    }
+    pub fn u16(self: MyCursor): int {
+        let a = self.byte();
+        let b = self.byte();
+        return a + b * 256;
+    }
+    pub fn u32(self: MyCursor): int {
+        let a = self.byte();
+        let b = self.byte();
+        let c = self.byte();
+        let d = self.byte();
+        return a + b * 256 + c * 65536 + d * 16777216;
+    }
+    // length-encoded integer.
+    pub fn lenenc(self: MyCursor): int {
+        let first = self.byte();
+        if (first < 251) { return first; }
+        if (first == 252) { return self.u16(); }
+        if (first == 253) {
+            let a = self.byte(); let b = self.byte(); let c = self.byte();
+            return a + b * 256 + c * 65536;
+        }
+        // 254: 8-byte LE.
+        let v = 0; let mul = 1; let i = 0;
+        while (i < 8) { v = v + self.byte() * mul; mul = mul * 256; i = i + 1; }
+        return v;
+    }
+    pub fn take(self: MyCursor, n: int): string {
+        // Bounds-safe: clamp to what is buffered so a short/truncated packet returns what it can instead
+        // of slicing past the end (which panics). Malformed server packets must never crash the driver.
+        let end = self.pos + n;
+        if (end > self.s.length) { end = self.s.length; }
+        let out = string.slice(self.s, self.pos, end);
+        self.pos = end;
+        return out;
+    }
+    // length-encoded string.
+    pub fn lenencStr(self: MyCursor): string {
+        let n = self.lenenc();
+        return self.take(n);
+    }
+    pub fn cstr(self: MyCursor): string {
+        // Bounds-safe: stop at the buffer end if there is no NUL terminator, so a malformed/truncated
+        // packet (e.g. a server ERR whose message is not NUL-terminated) cannot read past the string and
+        // panic. Previously `self.s[self.pos]` over-read the end and aborted the whole process.
+        let start = self.pos;
+        while (self.pos < self.s.length && self.s[self.pos] != 0) { self.pos = self.pos + 1; }
+        let out = string.slice(self.s, start, self.pos);
+        if (self.pos < self.s.length) { self.pos = self.pos + 1; }   // consume the NUL when present
+        return out;
+    }
+    pub fn skip(self: MyCursor, n: int): void { self.pos = self.pos + n; }
+    pub fn remaining(self: MyCursor): int { return self.s.length - self.pos; }
+}
+
+/// The server Handshake (protocol v10): version, server-version(cstr), conn-id(u32),
+/// auth-data-1(8), filler, cap-low(u16), charset(u8), status(u16), cap-high(u16),
+/// auth-data-len(u8), reserved(10), auth-data-2, auth-plugin-name(cstr). Returns the 20-byte
+/// salt (data1 ++ data2, trimmed) + the plugin name.
+pub struct Handshake {
+    pub salt: string,
+    pub plugin: string,
+    pub connId: int,      // T8: 4-byte thread/connection id (needed for KILL QUERY cancellation)
+    init(salt: string, plugin: string, connId: int) { self.salt = salt; self.plugin = plugin; self.connId = connId; }
+}
+pub fn parseHandshake(payload: string): Handshake {
+    let c = MyCursor(payload);
+    c.skip(1);            // protocol version (10)
+    let sv = c.cstr();    // server version
+    let connId = c.u32(); // connection (thread) id - T8 captures it for KILL QUERY
+    let salt1 = c.take(8);
+    c.skip(1);            // filler 0
+    c.skip(2);            // capability flags lower
+    c.skip(1);            // character set
+    c.skip(2);            // status flags
+    c.skip(2);            // capability flags upper
+    let authLen = c.byte();  // length of auth-plugin-data
+    c.skip(10);           // reserved
+    // auth-plugin-data-part-2: max(13, authLen - 8) bytes, whose trailing byte is a reserved NUL. The
+    // 20-byte scramble is salt1(8) + the first 12 bytes of part-2; the REST of part-2 (at minimum the
+    // trailing NUL) must still be CONSUMED so the cursor lands on the auth-plugin-name that follows.
+    // Previously only 12 bytes were taken and the trailing NUL was left in place, so `cstr()` read an
+    // EMPTY plugin name -- which broke the auth handshake against MySQL 8/9 (default caching_sha2_password),
+    // hanging/crashing connect. See tests/67_mysql_codec.ky.
+    let part2total = 13;
+    if (authLen - 8 > 13) { part2total = authLen - 8; }
+    let salt2 = c.take(12);
+    c.skip(part2total - 12);
+    let plugin = "mysql_native_password";
+    if (c.remaining() > 0) { plugin = c.cstr(); }
+    return Handshake(salt1 + salt2, plugin, connId);
+}
+
+// --- Result decoders ----------------------------------------------------------
+
+/// Column Definition (v41): catalog/schema/table/org_table/name/org_name (lenenc-str each),
+/// then a fixed block: len-of-fixed(lenenc,=0x0c), charset(u16), col_len(u32), type(u8),
+/// flags(u16), decimals(u8), filler(u16). We keep name + type -> typed Column.
+pub fn decodeColumnDef(payload: string): Column {
+    let c = MyCursor(payload);
+    c.lenencStr();        // catalog "def"
+    c.lenencStr();        // schema
+    c.lenencStr();        // table
+    c.lenencStr();        // org_table
+    let name = c.lenencStr();
+    c.lenencStr();        // org_name
+    c.lenenc();           // length of fixed-length fields (0x0c)
+    c.skip(2);            // charset
+    c.skip(4);            // column length
+    let t = c.byte();     // column type
+    return Column(name, typemap.typeToDbType(t));
+}
+
+/// A text-protocol result row: for each column, a lenenc-str, or 0xfb = NULL.
+pub fn decodeTextRow(payload: string, cols: List<Column>): Row {
+    let row = Row();
+    let c = MyCursor(payload);
+    let n = cols.size();
+    let i = 0;
+    while (i < n) {
+        let col = cols.get(i) ?? Column("", DbType.Text);
+        let marker = c.byte();
+        if (marker == 251) {                 // 0xfb = NULL
+            row.cells.push(typemap.decodeCell(col.type_oid, "", true));
+        } else {
+            // `marker` is the first byte of the value's lenenc length; decode the rest.
+            let len = marker;
+            if (marker == 252) { len = c.u16(); }
+            else if (marker == 253) { let a = c.byte(); let b = c.byte(); let cc = c.byte(); len = a + b * 256 + cc * 65536; }
+            else if (marker == 254) { len = 0; let mul = 1; let k = 0; while (k < 8) { len = len + c.byte() * mul; mul = mul * 256; k = k + 1; } }
+            row.cells.push(typemap.decodeCell(col.type_oid, c.take(len), false));
+        }
+        i = i + 1;
+    }
+    return row;
+}
+
+// ============================================================================
+// D6: server-side prepared statements - the MySQL binary protocol (COM_STMT_*).
+// ============================================================================
+
+// The raw MySQL column type byte plus its UNSIGNED flag, packed as `type | (unsigned<<8)`. Reads
+// the same column-definition packet as decodeColumnDef but keeps the wire type (+ flags), which
+// the binary protocol needs to size each value.
+pub fn columnTypeRaw(payload: string): int {
+    let c = MyCursor(payload);
+    c.lenencStr(); c.lenencStr(); c.lenencStr(); c.lenencStr(); c.lenencStr(); c.lenencStr(); // strings
+    c.lenenc();           // 0x0c
+    c.skip(2);            // charset
+    c.skip(4);            // column length
+    let t = c.byte();     // type
+    let flags = c.u16();  // flags - UNSIGNED_FLAG = 0x20 (32)
+    let uns = if ((flags / 32) % 2 == 1) 256 else 0;
+    return t + uns;
+}
+
+// lenenc integer (full: <251 one byte, else 0xfc/0xfd/0xfe forms).
+fn lenencInt(v: int): string {
+    if (v < 251) { return u8b(v); }
+    if (v < 65536) { return u8b(252) + u8b(v % 256) + u8b((v / 256) % 256); }
+    if (v < 16777216) { return u8b(253) + u24le(v); }
+    return u8b(254) + u32le(v) + u32le(0);
+}
+fn lenencStrFull(s: string): string { return lenencInt(s.length) + s; }
+
+// COM_STMT_PREPARE (0x16) + SQL.
+pub fn buildStmtPrepare(sql: string): string { return packet(0, u8b(22) + sql); }
+// COM_STMT_CLOSE (0x19) + statement id. Frees the server-side prepared statement; the server sends
+// no reply, so callers must not read one.
+pub fn buildStmtClose(stmtId: int): string { return packet(0, u8b(25) + u32le(stmtId)); }
+// An empty client packet at sequence `seq`. Sent as the LOCAL INFILE response terminator to tell the
+// server "no file data" and resynchronise the protocol when we refuse an unsolicited LOAD DATA request.
+pub fn buildEmptyPacket(seq: int): string { return packet(seq, ""); }
+// COM_STMT_FETCH (0x1c): stmt_id + num_rows -- fetch the next `numRows` from an OPEN server-side cursor
+// (opened by COM_STMT_EXECUTE with CURSOR_TYPE_READ_ONLY). This is the X4 streaming primitive.
+pub fn buildStmtFetch(stmtId: int, numRows: int): string { return packet(0, u8b(28) + u32le(stmtId) + u32le(numRows)); }
+// COM_STMT_RESET (0x1a): drop an open cursor's remaining rows + reset the statement, keeping it prepared
+// (unlike COM_STMT_CLOSE). Used to abandon a stream early without leaking the server-side cursor.
+pub fn buildStmtReset(stmtId: int): string { return packet(0, u8b(26) + u32le(stmtId)); }
+
+// COM_RESET_CONNECTION (0x1f): reset the session state without reconnecting - it rolls back any open
+// transaction, drops temporary tables, user variables, and SET options, and clears prepared statements
+// server-side. A connection pool sends this on release so no txn/session state leaks to the next borrower.
+// The server replies with a single OK packet.
+pub fn buildResetConnection(): string { return packet(0, u8b(31)); }
+
+// COM_STMT_EXECUTE (0x17): stmt_id, flags (0 = no cursor, 1 = CURSOR_TYPE_READ_ONLY), iteration_count=1,
+// then - if there are params - the NULL bitmap, new-params-bound=1, each param's type, then each
+// non-null param value as a lenenc string.
+pub fn buildStmtExecute(stmtId: int, params: List<DbValue>, cursor: bool): string {
+    let np = params.size();
+    let body = u8b(23) + u32le(stmtId) + u8b(if (cursor) 1 else 0) + u32le(1);
+    if (np > 0) {
+        let nbytes = (np + 7) / 8;
+        let nullmap = bytes.alloc(nbytes);
+        let k = 0;
+        while (k < nbytes) { bytes.write_byte(nullmap, k, 0); k = k + 1; }
+        let i = 0;
+        while (i < np) {
+            let p = params.get(i) ?? db.dbNull();
+            if (p.isNull()) {
+                let cur = bytes.read_byte(nullmap, i / 8);
+                bytes.write_byte(nullmap, i / 8, cur | (1 << (i % 8)));
+            }
+            i = i + 1;
+        }
+        let nmStr = nullmap as string;                 // owned local so the buffer is freed (not leaked)
+        body = body + nmStr + u8b(1);                  // bitmap + new_params_bound_flag
+        // Type array: each param gets its NATIVE binary type + unsigned flag, so the value below is sent
+        // typed-binary (exact) rather than as VAR_STRING text relying on server coercion (D3).
+        i = 0;
+        while (i < np) {
+            let p = params.get(i) ?? db.dbNull();
+            body = body + u8b(bindType(p)) + u8b(0);
+            i = i + 1;
+        }
+        // Value section: each non-null param in its binary wire form.
+        i = 0;
+        while (i < np) {
+            let p = params.get(i) ?? db.dbNull();
+            if (!p.isNull()) { body = body + bindValue(p); }
+            i = i + 1;
+        }
+    }
+    return packet(0, body);
+}
+// Write a 64-bit value as 8 little-endian bytes (`>>` + mask is sign-safe for the low byte each step).
+fn u64le8(v: long): string {
+    let p = bytes.alloc(8);
+    let i = 0;
+    while (i < 8) { bytes.write_byte(p, i, ((v >> (8 * i)) & 255) as int); i = i + 1; }
+    return p as string;
+}
+// MySQL binary-protocol field type for a bound param.
+fn bindType(p: DbValue): int {
+    if (p.kind == DbType.Bool) { return 1; }                               // MYSQL_TYPE_TINY
+    if (p.kind == DbType.Int4 || p.kind == DbType.Int8) { return 8; }      // MYSQL_TYPE_LONGLONG (8-byte)
+    if (p.kind == DbType.Float4 || p.kind == DbType.Float8) { return 5; }  // MYSQL_TYPE_DOUBLE
+    if (p.kind == DbType.Decimal) { return 246; }                          // MYSQL_TYPE_NEWDECIMAL (ASCII)
+    if (p.kind == DbType.Blob) { return 252; }                             // MYSQL_TYPE_BLOB
+    return 253;                                                            // MYSQL_TYPE_VAR_STRING (text/ts/uuid)
+}
+// Binary value bytes for a non-null bound param, matching bindType.
+fn bindValue(p: DbValue): string {
+    if (p.kind == DbType.Bool) { return u8b(if (p.asBool()) 1 else 0); }
+    if (p.kind == DbType.Int4 || p.kind == DbType.Int8) { return u64le8(p.asLong()); }
+    if (p.kind == DbType.Float4 || p.kind == DbType.Float8) { return u64le8(kyte_f64_bits(p.asDouble())); }
+    if (p.kind == DbType.Decimal) { return lenencStrFull(p.asText()); }    // NEWDECIMAL wire form is ASCII
+    if (p.kind == DbType.Blob) { return lenencStrFull(p.asText()); }
+    return lenencStrFull(typemap.valueToBindText(p));                      // text / timestamp / uuid
+}
+
+// Read `n` little-endian bytes into a 64-bit value.
+fn readLE(c: MyCursor, n: int): long {
+    let v: long = 0;
+    let mul: long = 1;
+    let i = 0;
+    while (i < n) { v = v + (c.byte() as long) * mul; mul = mul * 256; i = i + 1; }
+    return v;
+}
+// Two's-complement sign-extend a `width`-byte unsigned value.
+fn signExtend(v: long, width: int): long {
+    let bits: long = (width as long) * 8;
+    let half: long = 1;
+    let i = 0;
+    while (i < bits - 1) { half = half * 2; i = i + 1; }   // 2^(bits-1)
+    if (v >= half) { return v - half - half; }
+    return v;
+}
+
+// Decode ONE binary-protocol value for a column of raw type `tf` (type | unsigned<<8).
+fn decodeBinaryCell(c: MyCursor, tf: int, base: long): DbValue {
+    let t = tf % 256;
+    let uns = tf >= 256;
+    if (t == 1) {                                   // TINY (1 byte)
+        let v = readLE(c, 1);
+        return db.dbInt((if (uns) v else signExtend(v, 1)) as int);
+    }
+    if (t == 2 || t == 13) {                        // SHORT / YEAR (2 bytes)
+        let v = readLE(c, 2);
+        return db.dbInt((if (uns) v else signExtend(v, 2)) as int);
+    }
+    if (t == 3 || t == 9) {                         // LONG / INT24 (4 bytes)
+        let v = readLE(c, 4);
+        return db.dbLong(if (uns) v else signExtend(v, 4));
+    }
+    if (t == 8) {                                   // LONGLONG (8 bytes)
+        let lo = readLE(c, 4);                      // low 32 bits (0 .. 2^32-1)
+        let hi = readLE(c, 4);                      // high 32 bits
+        let v = hi * 4294967296 + lo;               // wraps to the correct 2's-complement i64 bit pattern
+        // Unsigned LONGLONG >= 2^63 would appear negative in an i64: represent it EXACTLY as a decimal
+        // (via u64 = hi*2^32 + lo) instead of silently wrapping to a negative number.
+        if (uns && v < 0) {
+            let d = decimal.fromString(`${hi}`) * 4294967296m + decimal.fromString(`${lo}`);
+            return DbValue(DbType.Decimal, 0, 0.0, d, `${d}`);   // set text form so getText works too
+        }
+        return db.dbLong(v);
+    }
+    if (t == 4) {                                   // FLOAT (4 IEEE bytes)
+        let raw = c.take(4);
+        return db.dbDouble(string.parseFloat(kyte_ieee_le_to_str(raw, 4)));
+    }
+    if (t == 5) {                                   // DOUBLE (8 IEEE bytes)
+        let raw = c.take(8);
+        return db.dbDouble(string.parseFloat(kyte_ieee_le_to_str(raw, 8)));
+    }
+    if (t == 0 || t == 246) {                       // DECIMAL / NEWDECIMAL (lenenc text)
+        let s = c.lenencStr();
+        return DbValue(DbType.Decimal, 0, 0.0, decimal.fromString(s), s);
+    }
+    if (t == 10 || t == 7 || t == 12) {             // DATE / TIMESTAMP / DATETIME (binary)
+        return db.dbTimestamp(decodeBinaryDateTime(c));
+    }
+    if (t == 11) {                                  // TIME (binary) - NOT a lenenc string
+        return db.dbText(decodeBinaryTime(c));
+    }
+    // STRING / VAR_STRING / VARCHAR / BLOB / JSON / etc. -> lenenc string. P4 lazy/borrowed decode (parity
+    // with the Postgres driver): the Row owns the whole binary payload (row.raw), so a string cell BORROWS a
+    // slice of it via dbLazy and defers the copy to asText()/asView(). An unread column costs nothing; a read
+    // one avoids a per-cell string allocation -- the dominant cost on a wide text result (Name/Description/...).
+    let slen = c.lenenc();
+    let soff = c.pos;
+    c.skip(slen);
+    return db.dbLazy(DbType.Text, base, soff, slen);
+}
+
+// Binary DATE/DATETIME/TIMESTAMP: a lenenc length (0/4/7/11) then year(2) month(1) day(1)
+// [hour(1) min(1) sec(1)] [microsec(4)] -> "YYYY-MM-DD HH:MM:SS".
+// Binary-protocol TIME: [len][is_neg][days u32][h][m][s]([micros u32] when len==12). Total hours =
+// days*24 + h. Previously this fell through to lenencStr and mis-read the structure (stream desync).
+fn decodeBinaryTime(c: MyCursor): string {
+    let len = c.lenenc();
+    if (len == 0) { return "00:00:00"; }
+    let neg = c.byte();
+    let days = c.u32();
+    let hh = c.byte(); let mm = c.byte(); let ss = c.byte();
+    let micro = 0;
+    if (len >= 12) {
+        let m0 = c.byte(); let m1 = c.byte(); let m2 = c.byte(); let m3 = c.byte();
+        micro = m0 + m1 * 256 + m2 * 65536 + m3 * 16777216;
+    }
+    let totalH = days * 24 + hh;
+    let sign = if (neg == 1) "-" else "";
+    let t = `${sign}${pad2(totalH)}:${pad2(mm)}:${pad2(ss)}`;
+    if (micro > 0) { return `${t}.${pad6(micro)}`; }
+    return t;
+}
+fn decodeBinaryDateTime(c: MyCursor): string {
+    let len = c.lenenc();
+    if (len == 0) { return "0000-00-00"; }
+    let year = c.u16();
+    let month = c.byte();
+    let day = c.byte();
+    let hour = 0; let min = 0; let sec = 0;
+    if (len >= 7) { hour = c.byte(); min = c.byte(); sec = c.byte(); }
+    let micro = 0;
+    if (len >= 11) {
+        let m0 = c.byte(); let m1 = c.byte(); let m2 = c.byte(); let m3 = c.byte();
+        micro = m0 + m1 * 256 + m2 * 65536 + m3 * 16777216;
+    }
+    let d = `${year}-${pad2(month)}-${pad2(day)}`;
+    if (len < 7) { return d; }
+    let t = `${d} ${pad2(hour)}:${pad2(min)}:${pad2(sec)}`;
+    if (micro > 0) { return `${t}.${pad6(micro)}`; }   // was dropped -> silent precision loss
+    return t;
+}
+fn pad2(v: int): string { if (v < 10) { return `0${v}`; } return `${v}`; }
+fn pad6(v: int): string {
+    let s = `${v}`;
+    while (s.length < 6) { s = `0${s}`; }
+    return s;
+}
+
+// A binary-protocol result row: 0x00 header, NULL bitmap ((ncols+9)/8 bytes, offset by 2 bits),
+// then a binary value for each non-null column.
+pub fn decodeBinaryRow(payload: string, cols: List<Column>, types: List<int>): Row {
+    let row = Row();
+    row.raw = payload;                  // P4: the Row owns the payload bytes; string cells borrow slices of it
+    let base = payload as long;         // (copying the Row into the ResultSet ARC-retains raw, keeping them alive)
+    let c = MyCursor(payload);
+    c.skip(1);                          // 0x00 packet header
+    let ncols = cols.size();
+    let nbytes = (ncols + 7 + 2) / 8;
+    let nullmap = c.take(nbytes);
+    let i = 0;
+    while (i < ncols) {
+        let bitpos = i + 2;
+        let nb = bytes.read_byte(nullmap, bitpos / 8);
+        let isNull = ((nb / (1 << (bitpos % 8))) % 2) == 1;
+        if (isNull) {
+            row.cells.push(db.dbNull());
+        } else {
+            row.cells.push(decodeBinaryCell(c, types.get(i) ?? 253, base));
+        }
+        i = i + 1;
+    }
+    return row;
+}
+
+/// ERR packet (first byte 0xff): error_code(u16), sql_state_marker('#')+sql_state(5),
+/// error_message(rest).
+pub fn decodeErr(payload: string): DbError {
+    let c = MyCursor(payload);
+    c.skip(1);            // 0xff
+    let number = c.u16(); // error code (was discarded)
+    let code = "";
+    if (c.remaining() > 0 && c.s[c.pos] == 35) {   // '#'
+        c.skip(1);
+        code = c.take(5);
+    }
+    let msg = c.take(c.remaining());
+    return DbError(code, msg).with(number, classifyMyErr(number));
+}
+// Map a MySQL error number onto the normalized db.DBERR_* taxonomy.
+fn classifyMyErr(n: int): int {
+    if (n == 1062) { return db.DBERR_UNIQUE_VIOLATION; }              // ER_DUP_ENTRY
+    if (n == 1048) { return db.DBERR_NOT_NULL; }                     // ER_BAD_NULL_ERROR
+    if (n == 1451 || n == 1452) { return db.DBERR_FOREIGN_KEY; }    // FK parent/child
+    if (n == 3819) { return db.DBERR_CHECK; }                       // ER_CHECK_CONSTRAINT_VIOLATED
+    if (n == 1213) { return db.DBERR_DEADLOCK; }                    // ER_LOCK_DEADLOCK
+    if (n == 1205) { return db.DBERR_LOCK_TIMEOUT; }                // ER_LOCK_WAIT_TIMEOUT
+    if (n == 1064 || n == 1146 || n == 1054) { return db.DBERR_SYNTAX; } // syntax / no table / bad col
+    if (n == 1045 || n == 1044) { return db.DBERR_AUTH; }           // access denied
+    if (n == 2002 || n == 2003 || n == 2006 || n == 2013) { return db.DBERR_CONNECTION; }
+    return db.DBERR_UNKNOWN;
+}
+
+// An OK packet reports affected_rows (lenenc) + last_insert_id (lenenc). First byte 0x00.
+pub fn okAffectedRows(payload: string): int {
+    let c = MyCursor(payload);
+    c.skip(1);            // 0x00
+    return c.lenenc();
+}
+
+// T14 Feature 1 (multi-resultset): the OK/EOF terminating packet carries a 16-bit status-flags
+// field; SERVER_MORE_RESULTS_EXISTS (0x0008) means another result set follows (a multi-statement
+// query or a stored procedure's several selects).
+pub fn moreResultsExists(statusFlags: int): bool { return (statusFlags & 0x0008) != 0; }
+
+// OK packet (CLIENT_PROTOCOL_41): 0x00, affected_rows(lenenc), last_insert_id(lenenc),
+// status_flags(u16), warnings(u16). Extract the status flags.
+pub fn okStatusFlags(payload: string): int {
+    let c = MyCursor(payload);
+    c.skip(1);            // 0x00
+    c.lenenc();           // affected_rows
+    c.lenenc();           // last_insert_id
+    if (c.remaining() < 2) { return 0; }
+    return c.u16();
+}
+
+// EOF packet (this build does NOT set CLIENT_DEPRECATE_EOF, so EOFs are present): 0xfe,
+// warnings(u16), status_flags(u16). Extract the status flags.
+pub fn eofStatusFlags(payload: string): int {
+    if (payload.length < 5) { return 0; }
+    let c = MyCursor(payload);
+    c.skip(1);            // 0xfe
+    c.u16();              // warnings
+    return c.u16();
+}
+
+// Is this result packet an end-of-stream EOF? (0xfe first byte, payload < 9 bytes).
+pub fn isEof(p: string): bool { return p.length > 0 && p.length < 9 && p[0] == 254; }
+pub fn isErr(p: string): bool { return p.length > 0 && p[0] == 255; }
+pub fn isOk(p: string): bool { return p.length > 0 && p[0] == 0; }
+// 0xfb as the FIRST byte of a query response is a LOCAL INFILE request (the server wants the client to
+// stream a local file for LOAD DATA LOCAL INFILE). We never send one, so an 0xfb here is either a
+// misconfigured server or an injection attempt; the caller must refuse it and resynchronise rather
+// than mis-read the byte as a column count.
+pub fn isLocalInfile(p: string): bool { return p.length > 0 && p[0] == 251; }
+
+// T8: the KILL QUERY statement for a connection id, using the driver's `${}` int->string rendering.
+pub fn buildKillQuery(connId: int): string { return `KILL QUERY ${connId}`; }
